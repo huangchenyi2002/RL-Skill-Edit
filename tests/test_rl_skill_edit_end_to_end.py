@@ -246,7 +246,7 @@ def test_staged_output_rejects_marker_with_unknown_field(
     assert not tuple(tmp_path.glob(".rl-output-staging-*"))
 
 
-def test_test_manifest_is_loaded_only_after_rl_optimization_freezes(
+def test_training_selects_skill_then_binds_test_digest_before_test_execution(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -255,6 +255,8 @@ def test_test_manifest_is_loaded_only_after_rl_optimization_freezes(
     events: list[str] = []
     original_optimize = cli.RLSkillEditOptimizer.optimize
     original_load_test = cli._load_test_manifest
+    original_atomic_write = cli._atomic_json_write
+    original_report = cli.run_frozen_report
     original_read_text = Path.read_text
     original_open = Path.open
 
@@ -263,28 +265,100 @@ def test_test_manifest_is_loaded_only_after_rl_optimization_freezes(
         events.append("optimized")
         return result
 
-    def load_test_after_freeze(config, optimization_manifests):
+    def load_test_after_selection(config, optimization_manifests):
         assert events == ["optimized"]
         events.append("test_loaded")
         return original_load_test(config, optimization_manifests)
 
+    def write_provenance_after_test_digest(path, value):
+        original_atomic_write(path, value)
+        if path.name == "freeze_provenance.json":
+            assert events == ["optimized", "test_loaded"]
+            events.append("provenance_written")
+
+    def report_after_provenance(**kwargs):
+        assert events == ["optimized", "test_loaded", "provenance_written"]
+        events.append("test_executed")
+        return original_report(**kwargs)
+
     def guarded_read_text(path: Path, *args, **kwargs):
         if path == test_manifest and not events:
-            raise AssertionError("Test manifest was read before optimization froze")
+            raise AssertionError("Test manifest was read before optimization finished")
         return original_read_text(path, *args, **kwargs)
 
     def guarded_open(path: Path, *args, **kwargs):
         if path == test_manifest and not events:
-            raise AssertionError("Test manifest was opened before optimization froze")
+            raise AssertionError(
+                "Test manifest was opened before optimization finished"
+            )
         return original_open(path, *args, **kwargs)
 
     monkeypatch.setattr(cli.RLSkillEditOptimizer, "optimize", optimize_then_mark)
-    monkeypatch.setattr(cli, "_load_test_manifest", load_test_after_freeze)
+    monkeypatch.setattr(cli, "_load_test_manifest", load_test_after_selection)
+    monkeypatch.setattr(cli, "_atomic_json_write", write_provenance_after_test_digest)
+    monkeypatch.setattr(cli, "run_frozen_report", report_after_provenance)
     monkeypatch.setattr(Path, "read_text", guarded_read_text)
     monkeypatch.setattr(Path, "open", guarded_open)
 
     run(config_path, seed=42)
-    assert events == ["optimized", "test_loaded"]
+    assert events == [
+        "optimized",
+        "test_loaded",
+        "provenance_written",
+        "test_executed",
+    ]
+
+
+def test_test_only_validates_full_provenance_binding_before_test_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = _smoke_config_in(tmp_path)
+    run(config_path, seed=42)
+    events: list[str] = []
+    original_schema = cli._validate_provenance_schema
+    original_load_test = cli._load_test_manifest
+    original_load_frozen = cli._load_frozen_rl
+    original_report = cli.run_frozen_report
+
+    def validate_schema_then_mark(provenance):
+        result = original_schema(provenance)
+        if "provenance_schema_validated" not in events:
+            events.append("provenance_schema_validated")
+        return result
+
+    def load_test_after_schema(config, optimization_manifests):
+        assert events == ["provenance_schema_validated"]
+        events.append("test_loaded")
+        return original_load_test(config, optimization_manifests)
+
+    def load_frozen_then_mark(**kwargs):
+        result = original_load_frozen(**kwargs)
+        assert events == ["provenance_schema_validated", "test_loaded"]
+        events.append("provenance_binding_validated")
+        return result
+
+    def report_after_binding(**kwargs):
+        assert events == [
+            "provenance_schema_validated",
+            "test_loaded",
+            "provenance_binding_validated",
+        ]
+        events.append("test_executed")
+        return original_report(**kwargs)
+
+    monkeypatch.setattr(cli, "_validate_provenance_schema", validate_schema_then_mark)
+    monkeypatch.setattr(cli, "_load_test_manifest", load_test_after_schema)
+    monkeypatch.setattr(cli, "_load_frozen_rl", load_frozen_then_mark)
+    monkeypatch.setattr(cli, "run_frozen_report", report_after_binding)
+
+    run(config_path, seed=42, test_only=True)
+    assert events == [
+        "provenance_schema_validated",
+        "test_loaded",
+        "provenance_binding_validated",
+        "test_executed",
+    ]
 
 
 def test_frozen_bundle_records_only_resolvable_relative_artifact_paths(

@@ -12,15 +12,19 @@ flowchart LR
     A --> E["Editor: one local patch"]
     E --> S
     E --> V["Validation selection"]
-    V --> F["Frozen RL Skill and provenance"]
-    F --> T["Blind Test"]
+    V --> F["Frozen RL Skill"]
+    F --> L["Sole Test loader and split digest"]
+    L --> B["Write or fully validate provenance"]
+    B --> T["Blind Test evaluator"]
     I --> T
 ```
 
 The Student and Editor model weights stay frozen. Only the external Markdown
 Skill and the small actor-critic parameters change during Train. Validation
-selects a checkpoint; Test is loaded only after the selected Skill and its
-provenance are frozen.
+selects a checkpoint. Test content is not read during optimization. After the
+selected Skill becomes immutable, the sole loader forms the Test digest;
+training writes that binding, while `--test-only` validates the full existing
+binding. Test evaluation begins only after that provenance step succeeds.
 
 The repository has one optimizer. The initial Skill is immutable input and a
 paired reporting baseline, not a second optimization method.
@@ -50,11 +54,14 @@ paired reporting baseline, not a second optimization method.
    content is not opened.
 2. The policy learns from paired Train reward. Validation is read-only and only
    selects the saved checkpoint.
-3. The selected Skill and strict provenance are frozen before the sole Test
-   loader opens the Test manifest and workbooks.
-4. Initial and RL Skills receive the same blind Test order, seeds, repetitions,
+3. After the selected Skill is immutable, the sole Test loader opens the Test
+   manifest and workbooks and forms the content-bound split digest.
+4. Training writes strict provenance with that digest. `--test-only` first checks
+   the schema, then recomputes the Test digest and completes every binding
+   comparison. Only a successful write or full comparison reaches evaluation.
+5. Initial and RL Skills receive the same blind Test order, seeds, repetitions,
    and cache-disabled protocol.
-5. The method bundle, reports, cache, manifest, and ownership marker are staged
+6. The method bundle, reports, cache, manifest, and ownership marker are staged
    and installed as one verified tree. A verified prior tree is retained at the
    deterministic `.previous` path; failed publication restores it.
 

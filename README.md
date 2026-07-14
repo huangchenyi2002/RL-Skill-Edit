@@ -15,12 +15,18 @@ reported beside the frozen RL result, but it is not another optimization method.
 3. The Editor proposes one strict local patch. Invalid patches are rejected.
 4. Paired Train reward updates the policy; Validation reward selects the saved
    checkpoint.
-5. After the Skill and provenance are frozen, the CLI runs a fresh blind Test for
-   the initial and RL-edited Skills with identical tasks, seeds, and repetitions.
+5. After Validation selects the final Skill, the sole Test loader reads the Test
+   manifest and workbooks to form the bound Test digest.
+6. Training writes provenance with that digest; `--test-only` recomputes the
+   digest and validates the complete existing binding. Only then does the CLI
+   execute a fresh blind Test for the initial and RL-edited Skills with identical
+   tasks, seeds, and repetitions.
 
-Test data never enters policy updates or checkpoint selection. `--test-only`
-accepts an existing result only when its Skill, configuration, splits,
-implementation, dependencies, summary, and seed still match the frozen provenance.
+Before optimization, preflight checks only the Test manifest path and does not
+read its contents or workbooks. Test data never enters policy updates or
+checkpoint selection. `--test-only` accepts an existing result only when its
+Skill, configuration, splits, implementation, dependencies, summary, and seed
+still match the frozen provenance.
 
 ## Repository layout
 
@@ -105,9 +111,10 @@ Run the API-free end-to-end smoke:
 bash scripts/run_smoke.sh
 ```
 
-## Outputs
+## Published output
 
-The real run publishes one complete tree under `results/rl_skill_edit/`:
+The real run publishes one complete tree under `results/rl_skill_edit/`. Its
+main files and generated subtrees are:
 
 | Path | Purpose |
 | --- | --- |
@@ -117,11 +124,21 @@ The real run publishes one complete tree under `results/rl_skill_edit/`:
 | `rl_skill_edit/rl_episode_summary.csv` | Episode returns and checkpoint paths |
 | `rl_skill_edit/rl_optimization_summary.json` | Final Train and Validation summary |
 | `rl_skill_edit/freeze_provenance.json` | Bindings checked by `--test-only` |
+| `rl_skill_edit/rollout_cache.json` | Train and Validation rollout cache |
+| `rl_skill_edit/editor_cache.json` | Real Editor response cache when Editor calls occur |
+| `rl_skill_edit/episodes/episode_*/` | Per-episode Skills, policy checkpoints, and edit trajectories |
+| `frozen_method_artifacts.json` | Frozen initial and RL Skill records used by reporting |
 | `method_comparison.csv` | Initial-versus-RL aggregate metrics and resource use |
+| `task_level_scores.csv` | Paired task-level Test scores |
 | `test_task_level_results.csv` | Ordered blind Test rewards |
 | `comparison_report.json` | Machine-readable paired Test report |
+| `comparison_rollout_cache.json` | Common reporting rollout cache |
 | `experiment_manifest.json` | Split, code, dependency, seed, and artifact hashes |
 | `.rl-skill-edit-output.json` | Ownership marker bound to the final output path |
+
+The deterministic synthetic Editor does not create `editor_cache.json`; a real
+run creates it only when an Editor request reaches the cache. Episode count and
+contents follow the configured optimizer settings.
 
 Publication is transactional. When a verified result already exists, it is kept
 at `results/.rl_skill_edit.previous` during replacement. The CLI validates the

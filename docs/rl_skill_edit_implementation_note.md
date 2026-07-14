@@ -1,9 +1,10 @@
 # RL-Skill-Edit implementation note
 
 The CLI implements one fixed sequence: load a neutral initial Markdown Skill,
-optimize it on Train, select the saved checkpoint on Validation, freeze the Skill
-and provenance, then run a fresh blind Test for the initial and RL-edited Skills.
-The initial Skill is an input and reporting baseline, not an optimizer.
+optimize it on Train, select and freeze the Skill on Validation, load Test once
+to form its content digest, write or fully validate provenance, then run a fresh
+blind Test for the initial and RL-edited Skills. The initial Skill is an input
+and reporting baseline, not an optimizer.
 
 The frozen Student receives exactly one active Skill. A NumPy actor-critic masks
 invalid actions and samples a Markdown module plus edit operator. The frozen
@@ -21,9 +22,14 @@ not replace VM or container isolation for generated code.
 
 Freeze provenance binds the initial and selected Skill digests, normalized
 configuration, ordered split digests, implementation files, `requirements.txt`,
-optimization summary, skill identity, and seed. `--test-only` rejects missing,
-unknown, or changed fields. The Test pass uses identical task order, seeds, and
-repetitions for both Skills, keeps prompts blind, and disables cache reads.
+optimization summary, skill identity, and seed. Before optimization, preflight
+checks the Test manifest path without reading its contents or workbooks. After
+Validation selection, the sole loader reads Test and forms the digest. Training
+writes provenance before Test execution. `--test-only` checks the provenance
+schema, loads Test to recompute its digest, compares every binding, and reaches
+Test execution only after the complete comparison succeeds. The Test pass uses
+identical task order, seeds, and repetitions for both Skills, keeps prompts
+blind, and disables cache reads.
 
 All optimization artifacts, five paired reports, the experiment manifest, cache,
 and hidden ownership marker are built in staging. Publication validates the full

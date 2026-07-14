@@ -5,7 +5,7 @@ import importlib.util
 import re
 import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import yaml
 
@@ -72,12 +72,64 @@ def _tracked_files() -> tuple[str, ...]:
     return tuple(path.decode("utf-8") for path in completed.stdout.split(b"\0") if path)
 
 
+def _casefold_path_components(path: str) -> tuple[str, ...]:
+    return tuple(component.casefold() for component in PurePosixPath(path).parts)
+
+
 def _matches_path(path: str, forbidden: str) -> bool:
-    return path == forbidden or path.startswith(f"{forbidden}/")
+    path_components = _casefold_path_components(path)
+    forbidden_components = _casefold_path_components(forbidden)
+    return bool(forbidden_components) and (
+        path_components[: len(forbidden_components)] == forbidden_components
+    )
+
+
+def _is_unexpected_runtime_python_path(path: str) -> bool:
+    components = _casefold_path_components(path)
+    return (
+        bool(components)
+        and components[-1].endswith(".py")
+        and components[0]
+        not in {
+            "rl_skill_edit",
+            "tests",
+        }
+    )
+
+
+def _original_namespace_imports(source: str) -> tuple[str, ...]:
+    tree = ast.parse(source)
+    forbidden_roots = {"baselines", "experiments", "src"}
+    invalid: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            modules = [node.module or ""]
+        else:
+            continue
+        for module in modules:
+            if module.split(".", 1)[0].casefold() in forbidden_roots:
+                invalid.append(module)
+    return tuple(invalid)
 
 
 def test_rl_is_the_top_level_package() -> None:
     assert importlib.util.find_spec("rl_skill_edit") is not None
+
+
+def test_boundary_helpers_reject_mixed_case_original_paths_and_imports() -> None:
+    assert _matches_path("SRC/teacher.md", "src")
+    assert _matches_path("Baselines/legacy.json", "baselines")
+    assert _matches_path("src/agent.py", "SRC")
+    assert not _matches_path("src_backup/agent.py", "src")
+    assert _is_unexpected_runtime_python_path("SRC/agent.PY")
+    assert _is_unexpected_runtime_python_path("EXPERIMENTS/run.py")
+    assert not _is_unexpected_runtime_python_path("RL_SKILL_EDIT/cli.PY")
+    assert not _is_unexpected_runtime_python_path("Tests/test_cli.py")
+    assert _original_namespace_imports(
+        "import Src.agent\nfrom EXPERIMENTS.x import runner\n"
+    ) == ("Src.agent", "EXPERIMENTS.x")
 
 
 def test_published_tree_contains_no_original_method_paths() -> None:
@@ -90,30 +142,18 @@ def test_published_tree_contains_no_original_method_paths() -> None:
     assert forbidden == []
 
     runtime_python = [
-        path
-        for path in tracked
-        if path.endswith(".py") and not path.startswith(("rl_skill_edit/", "tests/"))
+        path for path in tracked if _is_unexpected_runtime_python_path(path)
     ]
     assert runtime_python == []
 
 
 def test_runtime_has_no_original_namespace_imports_or_method_branches() -> None:
-    forbidden_import_roots = {"baselines", "experiments", "src"}
     invalid_imports: list[str] = []
     invalid_markers: list[str] = []
     for path in sorted((ROOT / "rl_skill_edit").rglob("*.py")):
         source = path.read_text(encoding="utf-8")
-        tree = ast.parse(source, filename=str(path))
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                modules = [alias.name for alias in node.names]
-            elif isinstance(node, ast.ImportFrom):
-                modules = [node.module or ""]
-            else:
-                continue
-            for module in modules:
-                if module.split(".", 1)[0] in forbidden_import_roots:
-                    invalid_imports.append(f"{path.relative_to(ROOT)}:{module}")
+        for module in _original_namespace_imports(source):
+            invalid_imports.append(f"{path.relative_to(ROOT)}:{module}")
         for marker in (
             r"\bcurrent_method\b",
             r"\brandom_edit(?:_search)?\b",
@@ -144,6 +184,15 @@ def test_public_documents_describe_only_rl_skill_edit() -> None:
     assert "python -m rl_skill_edit --config configs/rl_skill_edit.yaml" in readme
     assert "--test-only" in readme
     assert "scripts/run_smoke.sh" in readme
+    for published_path in (
+        "frozen_method_artifacts.json",
+        "task_level_scores.csv",
+        "comparison_rollout_cache.json",
+        "rl_skill_edit/rollout_cache.json",
+        "rl_skill_edit/editor_cache.json",
+        "rl_skill_edit/episodes/episode_*/",
+    ):
+        assert f"`{published_path}`" in readme
 
 
 def test_real_config_uses_the_rl_only_initial_skill() -> None:
