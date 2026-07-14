@@ -5,7 +5,6 @@ from __future__ import annotations
 import math
 import os
 import posixpath
-import re
 import signal
 import shutil
 import subprocess
@@ -28,6 +27,9 @@ from ..types import SkillArtifact
 
 _EXCEL_MAX_COLUMN = 16_384
 _EXCEL_MAX_ROW = 1_048_576
+_OFFICE_DOCUMENT_RELATIONSHIPS_NAMESPACE = (
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+)
 
 
 @dataclass(frozen=True)
@@ -49,6 +51,12 @@ class StudentTrajectory:
     total_cost_usd: float
     evaluation_valid: bool = True
     invalid_reason: str = ""
+
+
+@dataclass(frozen=True)
+class _WorksheetCellMetadata:
+    empty_numeric_cells: frozenset[tuple[int, int]]
+    empty_string_formula_cells: frozenset[tuple[int, int]]
 
 
 def _load_workbook_views(path: Path) -> tuple[Any, Any]:
@@ -95,7 +103,7 @@ def _strict_cell_value(
     *,
     row: int,
     column: int,
-    empty_numeric_cells: frozenset[tuple[int, int]],
+    metadata: _WorksheetCellMetadata,
 ) -> tuple[tuple[str, Any] | None, str]:
     raw_cell = raw_worksheet.cell(row=row, column=column)
     if isinstance(raw_cell, MergedCell):
@@ -117,10 +125,13 @@ def _strict_cell_value(
     if raw_cell.data_type == "e" or cached_cell.data_type == "e":
         return None, "unsupported_cell_value"
     if raw_cell.data_type == "f":
-        if cached_cell.value is None:
+        if (row, column) in metadata.empty_string_formula_cells:
+            value = ""
+        elif cached_cell.value is None:
             return None, "missing_formula_cache"
-        value = cached_cell.value
-    elif (row, column) in empty_numeric_cells:
+        else:
+            value = cached_cell.value
+    elif (row, column) in metadata.empty_numeric_cells:
         return None, "unsupported_cell_value"
     elif raw_cell.data_type == "inlineStr" and raw_cell.value is None:
         value = ""
@@ -142,77 +153,194 @@ def _strict_cell_value(
     return None, "unsupported_cell_value"
 
 
-def _local_xml_name(tag: str) -> str:
-    return tag.rsplit("}", 1)[-1]
+def _xml_root_namespace(root: ElementTree.Element, expected_name: str) -> str:
+    tag = root.tag
+    if not isinstance(tag, str) or not tag.startswith("{"):
+        raise ValueError(f"{expected_name} root must have a namespace")
+    namespace, separator, name = tag[1:].partition("}")
+    if not separator or not namespace or name != expected_name:
+        raise ValueError(f"invalid {expected_name} root")
+    return namespace
 
 
-def _worksheet_archive_path(archive: ZipFile, sheet_name: str) -> str:
-    workbook_root = ElementTree.fromstring(archive.read("xl/workbook.xml"))
-    relationship_id = None
-    for element in workbook_root.iter():
-        if _local_xml_name(element.tag) != "sheet":
-            continue
-        if element.attrib.get("name") != sheet_name:
-            continue
-        relationship_id = next(
-            (
-                value
-                for key, value in element.attrib.items()
-                if key.startswith("{") and _local_xml_name(key) == "id"
-            ),
-            None,
-        )
-        break
-    if not relationship_id:
-        raise ValueError(f"missing worksheet relationship: {sheet_name}")
+def _read_unique_archive_member(archive: ZipFile, member_name: str) -> bytes:
+    matches = tuple(info for info in archive.infolist() if info.filename == member_name)
+    if len(matches) != 1:
+        raise ValueError(f"archive member is not unique: {member_name}")
+    return archive.read(matches[0])
 
-    relationships_root = ElementTree.fromstring(
-        archive.read("xl/_rels/workbook.xml.rels")
-    )
-    target = None
-    for element in relationships_root.iter():
-        if (
-            _local_xml_name(element.tag) == "Relationship"
-            and element.attrib.get("Id") == relationship_id
-        ):
-            target = element.attrib.get("Target")
-            break
-    if not target:
-        raise ValueError(f"missing worksheet target: {sheet_name}")
+
+def _normalize_workbook_target(target: str) -> str:
+    if "\\" in target or target.startswith("//"):
+        raise ValueError("invalid workbook relationship target")
     archive_path = (
-        target.lstrip("/")
+        posixpath.normpath(target[1:])
         if target.startswith("/")
         else posixpath.normpath(posixpath.join("xl", target))
     )
-    if not archive_path.startswith("xl/"):
-        raise ValueError("worksheet target escapes workbook archive")
+    if archive_path in {"", ".", ".."} or not archive_path.startswith("xl/"):
+        raise ValueError("workbook relationship target escapes archive")
     return archive_path
 
 
-def _empty_numeric_cells(
+def _worksheet_archive_path(archive: ZipFile, sheet_name: str) -> str:
+    workbook_root = ElementTree.fromstring(
+        _read_unique_archive_member(archive, "xl/workbook.xml")
+    )
+    workbook_namespace = _xml_root_namespace(workbook_root, "workbook")
+    sheets_tag = f"{{{workbook_namespace}}}sheets"
+    sheet_tag = f"{{{workbook_namespace}}}sheet"
+    sheets_elements = tuple(
+        element for element in workbook_root if element.tag == sheets_tag
+    )
+    if len(sheets_elements) != 1:
+        raise ValueError("workbook must contain exactly one sheets element")
+    sheet_elements = tuple(
+        element for element in sheets_elements[0] if element.tag == sheet_tag
+    )
+    sheet_names = tuple(element.attrib.get("name") for element in sheet_elements)
+    if any(not name for name in sheet_names) or len(set(sheet_names)) != len(
+        sheet_names
+    ):
+        raise ValueError("worksheet names must be present and unique")
+    matching_sheets = tuple(
+        element
+        for element in sheet_elements
+        if element.attrib.get("name") == sheet_name
+    )
+    if len(matching_sheets) != 1:
+        raise ValueError(f"missing worksheet relationship: {sheet_name}")
+    relationship_attribute = f"{{{_OFFICE_DOCUMENT_RELATIONSHIPS_NAMESPACE}}}id"
+    sheet_relationship_ids = tuple(
+        element.attrib.get(relationship_attribute) for element in sheet_elements
+    )
+    if any(not item_id for item_id in sheet_relationship_ids) or len(
+        set(sheet_relationship_ids)
+    ) != len(sheet_relationship_ids):
+        raise ValueError("worksheet relationship ids must be present and unique")
+    relationship_id = matching_sheets[0].attrib[relationship_attribute]
+
+    relationships_root = ElementTree.fromstring(
+        _read_unique_archive_member(archive, "xl/_rels/workbook.xml.rels")
+    )
+    relationships_namespace = _xml_root_namespace(
+        relationships_root,
+        "Relationships",
+    )
+    relationship_tag = f"{{{relationships_namespace}}}Relationship"
+    relationships = tuple(
+        element for element in relationships_root if element.tag == relationship_tag
+    )
+    relationship_ids = tuple(element.attrib.get("Id") for element in relationships)
+    if any(not item_id for item_id in relationship_ids) or len(
+        set(relationship_ids)
+    ) != len(relationship_ids):
+        raise ValueError("workbook relationship ids must be present and unique")
+    if any(item_id not in relationship_ids for item_id in sheet_relationship_ids):
+        raise ValueError("worksheet relationship is missing its target")
+    relationship_targets = tuple(
+        element.attrib.get("Target") for element in relationships
+    )
+    if any(not target for target in relationship_targets):
+        raise ValueError("workbook relationship targets must be present")
+    target_modes = tuple(element.attrib.get("TargetMode") for element in relationships)
+    if any(mode not in {None, "Internal", "External"} for mode in target_modes):
+        raise ValueError("invalid workbook relationship target mode")
+    normalized_targets = tuple(
+        _normalize_workbook_target(target)
+        for mode, target in zip(
+            target_modes,
+            relationship_targets,
+            strict=True,
+        )
+        if mode in {None, "Internal"}
+    )
+    if len(set(normalized_targets)) != len(normalized_targets):
+        raise ValueError("internal workbook relationship targets must be unique")
+    matching_relationships = tuple(
+        element
+        for element in relationships
+        if element.attrib.get("Id") == relationship_id
+    )
+    if len(matching_relationships) != 1:
+        raise ValueError(f"missing worksheet target: {sheet_name}")
+    selected_relationship = matching_relationships[0]
+    target = selected_relationship.attrib.get("Target")
+    if not target:
+        raise ValueError(f"missing worksheet target: {sheet_name}")
+    if selected_relationship.attrib.get("TargetMode") not in {None, "Internal"}:
+        raise ValueError("worksheet target must be internal")
+    archive_path = _normalize_workbook_target(target)
+    _read_unique_archive_member(archive, archive_path)
+    return archive_path
+
+
+def _worksheet_cell_metadata(
     workbook_path: Path,
     sheet_name: str,
-) -> frozenset[tuple[int, int]]:
+) -> _WorksheetCellMetadata:
     with ZipFile(workbook_path) as archive:
         worksheet_path = _worksheet_archive_path(archive, sheet_name)
-        worksheet_root = ElementTree.fromstring(archive.read(worksheet_path))
-    coordinates = set()
-    for element in worksheet_root.iter():
-        if _local_xml_name(element.tag) != "c":
+        worksheet_root = ElementTree.fromstring(
+            _read_unique_archive_member(archive, worksheet_path)
+        )
+    worksheet_namespace = _xml_root_namespace(worksheet_root, "worksheet")
+    sheet_data_tag = f"{{{worksheet_namespace}}}sheetData"
+    row_tag = f"{{{worksheet_namespace}}}row"
+    cell_tag = f"{{{worksheet_namespace}}}c"
+    formula_tag = f"{{{worksheet_namespace}}}f"
+    value_tag = f"{{{worksheet_namespace}}}v"
+    sheet_data_elements = tuple(
+        element for element in worksheet_root if element.tag == sheet_data_tag
+    )
+    if len(sheet_data_elements) != 1:
+        raise ValueError("worksheet must contain exactly one sheetData element")
+    empty_numeric_cells = set()
+    empty_string_formula_cells = set()
+    seen_coordinates = set()
+    row_number = 0
+    for row_element in sheet_data_elements[0]:
+        if row_element.tag != row_tag:
             continue
-        if element.attrib.get("t") not in {None, "n"}:
-            continue
-        children = tuple(element)
-        if any(_local_xml_name(child.tag) == "f" for child in children):
-            continue
-        values = tuple(child for child in children if _local_xml_name(child.tag) == "v")
-        if not values or all((value.text or "").strip() for value in values):
-            continue
-        coordinate = element.attrib.get("r")
-        if not coordinate:
-            raise ValueError("numeric cell is missing its coordinate")
-        coordinates.add(coordinate_to_tuple(coordinate))
-    return frozenset(coordinates)
+        row_reference = row_element.attrib.get("r")
+        row_number = int(row_reference) if row_reference is not None else row_number + 1
+        column_number = 0
+        for element in row_element:
+            if element.tag != cell_tag:
+                continue
+            coordinate = element.attrib.get("r")
+            if coordinate is None:
+                column_number += 1
+                cell_coordinate = (row_number, column_number)
+            else:
+                cell_coordinate = coordinate_to_tuple(coordinate)
+                column_number = cell_coordinate[1]
+            if cell_coordinate in seen_coordinates:
+                raise ValueError(f"duplicate cell coordinate: {cell_coordinate}")
+            seen_coordinates.add(cell_coordinate)
+
+            children = tuple(element)
+            formulas = tuple(child for child in children if child.tag == formula_tag)
+            values = tuple(child for child in children if child.tag == value_tag)
+            if len(formulas) > 1 or len(values) > 1:
+                raise ValueError(f"ambiguous cell metadata: {cell_coordinate}")
+            if formulas:
+                if (
+                    element.attrib.get("t") == "str"
+                    and len(values) == 1
+                    and values[0].text in {None, ""}
+                ):
+                    empty_string_formula_cells.add(cell_coordinate)
+                continue
+            if element.attrib.get("t") not in {None, "n"}:
+                continue
+            if not values or all((value.text or "").strip() for value in values):
+                continue
+            empty_numeric_cells.add(cell_coordinate)
+    return _WorksheetCellMetadata(
+        empty_numeric_cells=frozenset(empty_numeric_cells),
+        empty_string_formula_cells=frozenset(empty_string_formula_cells),
+    )
 
 
 def _answer_range_coordinates(
@@ -297,6 +425,19 @@ class SpreadsheetExecutor:
                 "if os.name != 'nt':\n"
                 "    import resource\n"
                 "    resource.setrlimit(resource.RLIMIT_NPROC, (0, 0))\n"
+                "    if not callable(getattr(os, 'fork', None)):\n"
+                "        raise RuntimeError('process_isolation_unavailable')\n"
+                "    try:\n"
+                "        probe_pid = os.fork()\n"
+                "    except OSError:\n"
+                "        pass\n"
+                "    else:\n"
+                "        if probe_pid == 0:\n"
+                "            os._exit(0)\n"
+                "        waited_pid, _ = os.waitpid(probe_pid, 0)\n"
+                "        if waited_pid != probe_pid:\n"
+                "            raise RuntimeError('process_isolation_unavailable')\n"
+                "        raise RuntimeError('process_isolation_unavailable')\n"
                 f"code_path = {str(student_code_path)!r}\n"
                 f"namespace = {{'wb_path': {str(workbook_path)!r}, "
                 "'__file__': code_path, '__name__': '__main__'}\n"
@@ -406,14 +547,14 @@ class SpreadsheetExecutor:
             golden_raw_sheet = golden_raw[answer_sheet]
             golden_cached_sheet = golden_cached[answer_sheet]
             try:
-                result_empty_numeric = _empty_numeric_cells(
+                result_metadata = _worksheet_cell_metadata(
                     result_file,
                     answer_sheet,
                 )
             except (BadZipFile, KeyError, OSError, ValueError, ElementTree.ParseError):
                 return ExecutionResult(0.0, 0, 0, "invalid_result_workbook")
             try:
-                golden_empty_numeric = _empty_numeric_cells(
+                golden_metadata = _worksheet_cell_metadata(
                     golden_file,
                     answer_sheet,
                 )
@@ -442,7 +583,7 @@ class SpreadsheetExecutor:
                         result_cached_sheet,
                         row=row,
                         column=column,
-                        empty_numeric_cells=result_empty_numeric,
+                        metadata=result_metadata,
                     )
                     if result_error:
                         return ExecutionResult(0.0, 0, 0, result_error)
@@ -451,7 +592,7 @@ class SpreadsheetExecutor:
                         golden_cached_sheet,
                         row=row,
                         column=column,
-                        empty_numeric_cells=golden_empty_numeric,
+                        metadata=golden_metadata,
                     )
                     if golden_error:
                         return ExecutionResult(0.0, 0, 0, golden_error)
@@ -488,14 +629,34 @@ def build_student_system(
 
 
 def _extract_python(response: str) -> str:
-    for match in re.finditer(
-        r"```[ \t]*(?:(?:python|py)[ \t]*)?\r?\n(.*?)```",
-        response,
-        flags=re.IGNORECASE | re.DOTALL,
-    ):
-        code = match.group(1).strip()
-        if code:
-            return code
+    in_fence = False
+    capture = False
+    captured_lines: list[str] = []
+
+    for line in response.splitlines():
+        stripped = line.strip()
+        if not in_fence:
+            if not stripped.startswith("```"):
+                continue
+            language = stripped[3:].strip().lower()
+            in_fence = True
+            capture = language in {"", "python", "py"}
+            captured_lines = []
+            continue
+
+        if stripped == "```":
+            if capture:
+                code = "\n".join(captured_lines).strip()
+                if code:
+                    return code
+            in_fence = False
+            capture = False
+            captured_lines = []
+            continue
+
+        if capture:
+            captured_lines.append(line)
+
     return ""
 
 

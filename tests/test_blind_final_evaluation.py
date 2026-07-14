@@ -6,9 +6,12 @@ import json
 import os
 import signal
 import subprocess
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from types import MappingProxyType
+from xml.etree import ElementTree
+from zipfile import ZipFile
 
 import pytest
 from openpyxl import Workbook, load_workbook
@@ -75,6 +78,130 @@ def _write_workbook(path: Path, value: object) -> None:
     workbook.save(path)
 
 
+def _rewrite_archive_xml(
+    path: Path,
+    member_name: str,
+    mutate: Callable[[ElementTree.Element], None],
+) -> None:
+    with ZipFile(path) as source:
+        members = [(info, source.read(info.filename)) for info in source.infolist()]
+    rewritten_members = []
+    found = False
+    for info, data in members:
+        if info.filename == member_name:
+            root = ElementTree.fromstring(data)
+            mutate(root)
+            data = ElementTree.tostring(root)
+            found = True
+        rewritten_members.append((info, data))
+    assert found
+    rewritten_path = path.with_name(f"{path.stem}.rewritten.xlsx")
+    with ZipFile(rewritten_path, "w") as destination:
+        for info, data in rewritten_members:
+            destination.writestr(info, data)
+    rewritten_path.replace(path)
+
+
+def _set_formula_cache_metadata(
+    path: Path,
+    *,
+    cell_type: str,
+    include_value: bool,
+    append_duplicate_outside_sheet_data: bool = False,
+    append_foreign_value: bool = False,
+    worksheet_name: str = "xl/worksheets/sheet1.xml",
+) -> None:
+    def mutate(root: ElementTree.Element) -> None:
+        cell = next(
+            element
+            for element in root.iter()
+            if element.tag.rsplit("}", 1)[-1] == "c" and element.attrib.get("r") == "A1"
+        )
+        cell.set("t", cell_type)
+        value_elements = [
+            child for child in cell if child.tag.rsplit("}", 1)[-1] == "v"
+        ]
+        for value_element in value_elements:
+            cell.remove(value_element)
+        if include_value:
+            namespace = cell.tag.split("}", 1)[0].lstrip("{")
+            ElementTree.SubElement(cell, f"{{{namespace}}}v")
+        if append_foreign_value:
+            ElementTree.SubElement(cell, "{urn:evil}v")
+        if append_duplicate_outside_sheet_data:
+            namespace = cell.tag.split("}", 1)[0].lstrip("{")
+            duplicate = ElementTree.SubElement(
+                root,
+                f"{{{namespace}}}c",
+                {"r": "A1", "t": "str"},
+            )
+            ElementTree.SubElement(
+                duplicate, f"{{{namespace}}}f"
+            ).text = 'IF(1=1,"","")'
+            ElementTree.SubElement(duplicate, f"{{{namespace}}}v")
+
+    _rewrite_archive_xml(path, worksheet_name, mutate)
+
+
+def _workbook_relationship_id(path: Path, sheet_name: str) -> str:
+    office_relationship_namespace = (
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    )
+    with ZipFile(path) as archive:
+        root = ElementTree.fromstring(archive.read("xl/workbook.xml"))
+    namespace = root.tag.split("}", 1)[0].lstrip("{")
+    sheets = next(child for child in root if child.tag == f"{{{namespace}}}sheets")
+    sheet = next(
+        child
+        for child in sheets
+        if child.tag == f"{{{namespace}}}sheet"
+        and child.attrib.get("name") == sheet_name
+    )
+    return sheet.attrib[f"{{{office_relationship_namespace}}}id"]
+
+
+def _append_fake_sheet_outside_sheets(
+    path: Path,
+    *,
+    fake_name: str,
+    target_sheet_name: str,
+) -> None:
+    relationship_id = _workbook_relationship_id(path, target_sheet_name)
+    office_relationship_namespace = (
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    )
+
+    def mutate(root: ElementTree.Element) -> None:
+        namespace = root.tag.split("}", 1)[0].lstrip("{")
+        fake = ElementTree.Element(
+            f"{{{namespace}}}sheet",
+            {
+                "name": fake_name,
+                "sheetId": "999",
+                f"{{{office_relationship_namespace}}}id": relationship_id,
+            },
+        )
+        root.insert(0, fake)
+
+    _rewrite_archive_xml(path, "xl/workbook.xml", mutate)
+
+
+def _duplicate_workbook_relationship_id(path: Path, *, sheet_name: str) -> None:
+    relationship_id = _workbook_relationship_id(path, sheet_name)
+
+    def mutate(root: ElementTree.Element) -> None:
+        namespace = root.tag.split("}", 1)[0].lstrip("{")
+        tag = f"{{{namespace}}}Relationship"
+        relationship = next(
+            child
+            for child in root
+            if child.tag == tag and child.attrib.get("Id") == relationship_id
+        )
+        root.append(ElementTree.Element(tag, dict(relationship.attrib)))
+
+    _rewrite_archive_xml(path, "xl/_rels/workbook.xml.rels", mutate)
+
+
 def _execute_without_editing(
     init_file: Path,
     golden_file: Path,
@@ -96,6 +223,23 @@ def _process_exists(process_id: int) -> bool:
     except ProcessLookupError:
         return False
     return True
+
+
+def _install_runner_startup_hook(monkeypatch, source: str) -> None:
+    real_popen = subprocess.Popen
+
+    def instrumented_popen(command, **kwargs):
+        runner_path = Path(command[1])
+        runner_path.with_name("resource.py").write_text(
+            source,
+            encoding="utf-8",
+        )
+        return real_popen(command, **kwargs)
+
+    monkeypatch.setattr(
+        "rl_skill_edit.adapters.spreadsheet.subprocess.Popen",
+        instrumented_popen,
+    )
 
 
 def _final_task(tmp_path: Path) -> dict:
@@ -761,6 +905,154 @@ def test_executor_rejects_uncached_formula_values_instead_of_matching_none(
     assert result == ExecutionResult(0.0, 0, 0, "missing_formula_cache")
 
 
+def test_executor_matches_formula_cells_with_cached_empty_strings(
+    tmp_path: Path,
+) -> None:
+    init_file = tmp_path / "input.xlsx"
+    golden_file = tmp_path / "golden.xlsx"
+    for path in (init_file, golden_file):
+        _write_workbook(path, '=IF(1=1,"","")')
+        _set_formula_cache_metadata(
+            path,
+            cell_type="str",
+            include_value=True,
+        )
+
+    result = _execute_without_editing(init_file, golden_file)
+
+    assert result == ExecutionResult(1.0, 1, 1)
+
+
+@pytest.mark.parametrize(
+    ("cell_type", "include_value"),
+    [("str", False), ("n", True)],
+)
+def test_executor_rejects_missing_or_non_string_empty_formula_cache(
+    tmp_path: Path,
+    cell_type: str,
+    include_value: bool,
+) -> None:
+    init_file = tmp_path / "input.xlsx"
+    golden_file = tmp_path / "golden.xlsx"
+    for path in (init_file, golden_file):
+        _write_workbook(path, '=IF(1=1,"","")')
+        _set_formula_cache_metadata(
+            path,
+            cell_type=cell_type,
+            include_value=include_value,
+        )
+
+    result = _execute_without_editing(init_file, golden_file)
+
+    assert result == ExecutionResult(0.0, 0, 0, "missing_formula_cache")
+
+
+def test_executor_ignores_formula_metadata_outside_sheet_data(
+    tmp_path: Path,
+) -> None:
+    init_file = tmp_path / "input.xlsx"
+    golden_file = tmp_path / "golden.xlsx"
+    _write_workbook(init_file, '=IF(1=1,"","")')
+    _set_formula_cache_metadata(
+        init_file,
+        cell_type="str",
+        include_value=False,
+        append_duplicate_outside_sheet_data=True,
+    )
+    _write_workbook(golden_file, '=IF(1=1,"","")')
+    _set_formula_cache_metadata(
+        golden_file,
+        cell_type="str",
+        include_value=True,
+    )
+
+    result = _execute_without_editing(init_file, golden_file)
+
+    assert result == ExecutionResult(0.0, 0, 0, "missing_formula_cache")
+
+
+def test_executor_ignores_formula_cache_from_foreign_xml_namespace(
+    tmp_path: Path,
+) -> None:
+    init_file = tmp_path / "input.xlsx"
+    golden_file = tmp_path / "golden.xlsx"
+    _write_workbook(init_file, '=IF(1=1,"","")')
+    _set_formula_cache_metadata(
+        init_file,
+        cell_type="str",
+        include_value=False,
+        append_foreign_value=True,
+    )
+    _write_workbook(golden_file, '=IF(1=1,"","")')
+    _set_formula_cache_metadata(
+        golden_file,
+        cell_type="str",
+        include_value=True,
+    )
+
+    result = _execute_without_editing(init_file, golden_file)
+
+    assert result == ExecutionResult(0.0, 0, 0, "missing_formula_cache")
+
+
+def test_executor_ignores_sheet_mapping_outside_sheets(tmp_path: Path) -> None:
+    init_file = tmp_path / "input.xlsx"
+    golden_file = tmp_path / "golden.xlsx"
+    workbook = Workbook()
+    answer_sheet = workbook.active
+    answer_sheet.title = "SECRET_FINAL_SHEET"
+    answer_sheet["A1"] = '=IF(1=1,"","")'
+    decoy_sheet = workbook.create_sheet("DECOY")
+    decoy_sheet["A1"] = '=IF(1=1,"","")'
+    workbook.save(init_file)
+    _set_formula_cache_metadata(
+        init_file,
+        cell_type="str",
+        include_value=False,
+    )
+    _set_formula_cache_metadata(
+        init_file,
+        cell_type="str",
+        include_value=True,
+        worksheet_name="xl/worksheets/sheet2.xml",
+    )
+    _append_fake_sheet_outside_sheets(
+        init_file,
+        fake_name="SECRET_FINAL_SHEET",
+        target_sheet_name="DECOY",
+    )
+    _write_workbook(golden_file, '=IF(1=1,"","")')
+    _set_formula_cache_metadata(
+        golden_file,
+        cell_type="str",
+        include_value=True,
+    )
+
+    result = _execute_without_editing(init_file, golden_file)
+
+    assert result == ExecutionResult(0.0, 0, 0, "missing_formula_cache")
+
+
+def test_executor_rejects_duplicate_workbook_relationship_id(tmp_path: Path) -> None:
+    init_file = tmp_path / "input.xlsx"
+    golden_file = tmp_path / "golden.xlsx"
+    for path in (init_file, golden_file):
+        _write_workbook(path, '=IF(1=1,"","")')
+        _set_formula_cache_metadata(
+            path,
+            cell_type="str",
+            include_value=True,
+        )
+    _duplicate_workbook_relationship_id(
+        init_file,
+        sheet_name="SECRET_FINAL_SHEET",
+    )
+
+    result = _execute_without_editing(init_file, golden_file)
+
+    assert result == ExecutionResult(0.0, 0, 0, "invalid_result_workbook")
+
+
 def test_executor_distinguishes_boolean_from_numeric_values(tmp_path: Path) -> None:
     init_file = tmp_path / "input.xlsx"
     golden_file = tmp_path / "golden.xlsx"
@@ -958,6 +1250,7 @@ def test_executor_timeout_is_invalid_and_uses_only_allowed_environment(
 
     def fake_popen(command, **kwargs):
         captured["command"] = command
+        captured["runner_source"] = Path(command[1]).read_text(encoding="utf-8")
         captured.update(kwargs)
         return TimedOutProcess()
 
@@ -990,6 +1283,14 @@ def test_executor_timeout_is_invalid_and_uses_only_allowed_environment(
         "PYTHONDONTWRITEBYTECODE",
     }
     assert captured["start_new_session"] is (os.name != "nt")
+    runner_source = captured["runner_source"]
+    assert runner_source.index("resource.setrlimit") < runner_source.index(
+        "probe_pid = os.fork()"
+    )
+    assert runner_source.index("probe_pid = os.fork()") < runner_source.index(
+        "code_path ="
+    )
+    assert "os.waitpid(probe_pid, 0)" in runner_source
 
 
 @pytest.mark.skipif(os.name == "nt", reason="RLIMIT_NPROC is POSIX-only")
@@ -1053,6 +1354,105 @@ def test_executor_prevents_detached_descendants_for_every_exit_path(
     finally:
         if child_pid is not None and _process_exists(child_pid):
             os.kill(child_pid, signal.SIGKILL)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="fork self-probe is POSIX-only")
+def test_executor_fails_closed_and_reaps_probe_when_rlimit_is_ineffective(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    init_file = tmp_path / "input.xlsx"
+    golden_file = tmp_path / "golden.xlsx"
+    student_marker = tmp_path / "student-ran.txt"
+    probe_pid_file = tmp_path / "probe.pid"
+    waited_file = tmp_path / "probe.waited"
+    _write_workbook(init_file, "same")
+    _write_workbook(golden_file, "same")
+    _install_runner_startup_hook(
+        monkeypatch,
+        (
+            "import os\n"
+            "from pathlib import Path\n"
+            "RLIMIT_NPROC = 1\n"
+            "def setrlimit(*args, **kwargs):\n"
+            "    pass\n"
+            "_real_fork = os.fork\n"
+            "_real_waitpid = os.waitpid\n"
+            "def _tracked_fork():\n"
+            "    pid = _real_fork()\n"
+            "    if pid > 0:\n"
+            f"        Path({str(probe_pid_file)!r}).write_text(str(pid))\n"
+            "    return pid\n"
+            "def _tracked_waitpid(pid, options):\n"
+            "    waited_pid, status = _real_waitpid(pid, options)\n"
+            f"    with Path({str(waited_file)!r}).open('a') as handle:\n"
+            "        handle.write(f'{pid}:{options}:{waited_pid}:{status}\\n')\n"
+            "    return waited_pid, status\n"
+            "os.fork = _tracked_fork\n"
+            "os.waitpid = _tracked_waitpid\n"
+        ),
+    )
+
+    result = SpreadsheetExecutor().execute_and_score(
+        code=(
+            "from pathlib import Path\n"
+            f"Path({str(student_marker)!r}).write_text('ran')\n"
+        ),
+        init_file=str(init_file),
+        golden_file=str(golden_file),
+        answer_position="A1",
+        answer_sheet="SECRET_FINAL_SHEET",
+    )
+
+    assert "process_isolation_unavailable" in result.error
+    assert not student_marker.exists()
+    probe_pid = int(probe_pid_file.read_text(encoding="utf-8"))
+    wait_calls = tuple(
+        tuple(int(value) for value in line.split(":"))
+        for line in waited_file.read_text(encoding="utf-8").splitlines()
+    )
+    assert len(wait_calls) == 1
+    requested_pid, options, waited_pid, status = wait_calls[0]
+    assert requested_pid == probe_pid
+    assert options == 0
+    assert waited_pid == probe_pid
+    assert os.waitstatus_to_exitcode(status) == 0
+
+
+@pytest.mark.skipif(os.name == "nt", reason="fork self-probe is POSIX-only")
+def test_executor_fails_closed_when_posix_fork_is_unavailable(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    init_file = tmp_path / "input.xlsx"
+    golden_file = tmp_path / "golden.xlsx"
+    student_marker = tmp_path / "student-ran.txt"
+    _write_workbook(init_file, "same")
+    _write_workbook(golden_file, "same")
+    _install_runner_startup_hook(
+        monkeypatch,
+        (
+            "import os\n"
+            "RLIMIT_NPROC = 1\n"
+            "def setrlimit(*args, **kwargs):\n"
+            "    pass\n"
+            "del os.fork\n"
+        ),
+    )
+
+    result = SpreadsheetExecutor().execute_and_score(
+        code=(
+            "from pathlib import Path\n"
+            f"Path({str(student_marker)!r}).write_text('ran')\n"
+        ),
+        init_file=str(init_file),
+        golden_file=str(golden_file),
+        answer_position="A1",
+        answer_sheet="SECRET_FINAL_SHEET",
+    )
+
+    assert "process_isolation_unavailable" in result.error
+    assert not student_marker.exists()
 
 
 def test_executor_does_not_insert_an_automatic_save(tmp_path: Path) -> None:
@@ -1356,6 +1756,42 @@ def test_student_rejects_non_python_fenced_blocks_before_execution(
 
     assert trajectory.evaluation_valid is False
     assert trajectory.invalid_reason == "missing_executable_code"
+
+
+def test_student_skips_non_python_fence_and_extracts_following_python(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    python_code = "workbook_value = 1"
+    client = RecordingClient(
+        response=(
+            "```bash\n"
+            "echo must-not-run\n"
+            "```\n"
+            "This explanation is not executable.\n"
+            "```python\n"
+            f"{python_code}\n"
+            "```"
+        )
+    )
+    student = SpreadsheetStudent(STUDENT_CONFIG, client)
+    captured: dict[str, object] = {}
+
+    def execute_and_score(**kwargs) -> ExecutionResult:
+        captured.update(kwargs)
+        return ExecutionResult(1.0, 1, 1)
+
+    monkeypatch.setattr(student.executor, "execute_and_score", execute_and_score)
+
+    trajectory = student.run_task(
+        _final_task(tmp_path),
+        SkillArtifact("main", "main", "", "## Rule\nUpdate cells."),
+        blind=True,
+        seed=7,
+    )
+
+    assert trajectory.evaluation_valid is True
+    assert captured["code"] == python_code
 
 
 def test_executor_injects_wb_path_without_preceding_future_import(
