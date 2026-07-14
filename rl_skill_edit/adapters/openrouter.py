@@ -9,7 +9,6 @@ from collections.abc import Mapping
 from typing import Any
 
 import httpx
-from openai import OpenAI
 
 
 _PROXY_ENV_VARIABLES = (
@@ -20,6 +19,75 @@ _PROXY_ENV_VARIABLES = (
     "ALL_PROXY",
     "all_proxy",
 )
+
+
+def _field(value: Any, name: str) -> Any:
+    if isinstance(value, Mapping):
+        return value.get(name)
+    return getattr(value, name, None)
+
+
+class _OpenRouterCompletions:
+    def __init__(
+        self,
+        http_client: httpx.Client,
+        base_url: str,
+        api_key: str,
+    ) -> None:
+        self._http_client = http_client
+        self._url = f"{base_url.rstrip('/')}/chat/completions"
+        self._api_key = api_key
+
+    def create(
+        self,
+        *,
+        model: str,
+        messages: list[dict[str, Any]],
+        temperature: float,
+        max_tokens: int,
+        extra_headers: Mapping[str, str],
+        seed: int | None = None,
+    ) -> Any:
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if seed is not None:
+            payload["seed"] = seed
+        headers = {
+            **extra_headers,
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
+        }
+        response = self._http_client.post(
+            self._url,
+            json=payload,
+            headers=headers,
+        )
+        response.raise_for_status()
+        body = response.json()
+        if not isinstance(body, Mapping):
+            raise ValueError("OpenRouter response must be a JSON object")
+        return body
+
+
+class _OpenRouterChat:
+    def __init__(self, completions: _OpenRouterCompletions) -> None:
+        self.completions = completions
+
+
+class _OpenRouterAPI:
+    def __init__(
+        self,
+        http_client: httpx.Client,
+        base_url: str,
+        api_key: str,
+    ) -> None:
+        self.chat = _OpenRouterChat(
+            _OpenRouterCompletions(http_client, base_url, api_key)
+        )
 
 
 class OpenRouterClient:
@@ -78,12 +146,7 @@ class OpenRouterClient:
         http_client = httpx.Client(**http_client_kwargs)
 
         self.config = config
-        self.client = OpenAI(
-            api_key=api_key,
-            base_url=base_url,
-            http_client=http_client,
-            max_retries=0,
-        )
+        self.client = _OpenRouterAPI(http_client, base_url, api_key)
         self.extra_headers = {
             "HTTP-Referer": "http://localhost",
             "X-Title": "RL-Skill-Edit",
@@ -98,10 +161,18 @@ class OpenRouterClient:
         self._usage_lock = threading.Lock()
 
     def _record_call(self, usage_info: dict[str, Any]) -> None:
+        input_tokens = int(usage_info.get("input_tokens", 0))
+        output_tokens = int(usage_info.get("output_tokens", 0))
+        cost_usd = float(usage_info.get("cost_usd", 0.0))
+        if not math.isfinite(cost_usd):
+            raise ValueError("recorded token cost must be finite")
         with self._usage_lock:
-            self.total_input_tokens += int(usage_info.get("input_tokens", 0))
-            self.total_output_tokens += int(usage_info.get("output_tokens", 0))
-            self.total_cost_usd += float(usage_info.get("cost_usd", 0.0))
+            total_cost_usd = self.total_cost_usd + cost_usd
+            if not math.isfinite(total_cost_usd):
+                raise ValueError("accumulated token cost must be finite")
+            self.total_input_tokens += input_tokens
+            self.total_output_tokens += output_tokens
+            self.total_cost_usd = total_cost_usd
             self.call_log.append(dict(usage_info))
 
     @staticmethod
@@ -110,13 +181,17 @@ class OpenRouterClient:
         call_type: str,
         error_kind: str,
         error_message: str = "",
+        *,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        total_tokens: int = 0,
     ) -> dict[str, Any]:
         return {
             "model": model,
             "call_type": call_type,
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "total_tokens": 0,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
             "cost_usd": 0.0,
             "ok": False,
             "error_kind": error_kind,
@@ -131,14 +206,27 @@ class OpenRouterClient:
         if model not in prices:
             raise ValueError(f"missing token price for model: {model}")
         price = prices[model]
-        if (
-            isinstance(price, bool)
-            or not isinstance(price, (int, float))
-            or not math.isfinite(float(price))
-            or float(price) < 0.0
-        ):
+        if isinstance(price, bool) or not isinstance(price, (int, float)):
             raise ValueError(f"invalid token price for model: {model}")
-        return float(price)
+        try:
+            cost_rate = float(price)
+        except OverflowError as exc:
+            raise ValueError(f"invalid token price for model: {model}") from exc
+        if not math.isfinite(cost_rate) or cost_rate < 0.0:
+            raise ValueError(f"invalid token price for model: {model}")
+        return cost_rate
+
+    @staticmethod
+    def _calculate_cost(total_tokens: int, cost_rate: float) -> float:
+        if cost_rate == 0.0:
+            return 0.0
+        try:
+            cost = total_tokens / 1000.0 * cost_rate
+        except OverflowError as exc:
+            raise ValueError("calculated token cost is not finite") from exc
+        if not math.isfinite(cost):
+            raise ValueError("calculated token cost is not finite")
+        return cost
 
     def chat(
         self,
@@ -188,16 +276,16 @@ class OpenRouterClient:
             self._record_call(failed)
             return "", failed
 
-        provider_usage = getattr(response, "usage", None)
+        provider_usage = _field(response, "usage")
         if provider_usage is None:
             failed = self._failed_usage(model, call_type, "empty_response")
             self._record_call(failed)
             return "", failed
 
         try:
-            input_tokens = provider_usage.prompt_tokens
-            output_tokens = provider_usage.completion_tokens
-            total_tokens = provider_usage.total_tokens
+            input_tokens = _field(provider_usage, "prompt_tokens")
+            output_tokens = _field(provider_usage, "completion_tokens")
+            total_tokens = _field(provider_usage, "total_tokens")
             token_counts = (input_tokens, output_tokens, total_tokens)
             if any(
                 isinstance(value, bool) or not isinstance(value, int)
@@ -213,9 +301,28 @@ class OpenRouterClient:
             self._record_call(failed)
             return "", failed
 
-        choices = getattr(response, "choices", None)
-        message = getattr(choices[0], "message", None) if choices else None
-        text = getattr(message, "content", None)
+        try:
+            cost_usd = self._calculate_cost(total_tokens, cost_rate)
+        except ValueError as exc:
+            failed = self._failed_usage(
+                model,
+                call_type,
+                "invalid_cost",
+                str(exc),
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=total_tokens,
+            )
+            self._record_call(failed)
+            return "", failed
+
+        choices = _field(response, "choices")
+        message = (
+            _field(choices[0], "message")
+            if isinstance(choices, list) and choices
+            else None
+        )
+        text = _field(message, "content")
         ok = isinstance(text, str) and bool(text.strip())
         usage_info = {
             "model": model,
@@ -223,12 +330,25 @@ class OpenRouterClient:
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "total_tokens": total_tokens,
-            "cost_usd": (input_tokens + output_tokens) / 1000.0 * cost_rate,
+            "cost_usd": cost_usd,
             "ok": ok,
             "error_kind": None if ok else "empty_response",
             "error_message": "",
         }
-        self._record_call(usage_info)
+        try:
+            self._record_call(usage_info)
+        except ValueError as exc:
+            failed = self._failed_usage(
+                model,
+                call_type,
+                "invalid_cost",
+                str(exc),
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=total_tokens,
+            )
+            self._record_call(failed)
+            return "", failed
         return (text if ok else ""), usage_info
 
     def cost_summary(self) -> dict[str, Any]:

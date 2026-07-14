@@ -1,4 +1,7 @@
 import importlib.util
+import json
+import math
+import os
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
@@ -17,6 +20,16 @@ PROXY_ENV_VARIABLES = (
     "ALL_PROXY",
     "all_proxy",
 )
+
+UNRELATED_OPENAI_ENV = {
+    "OPENAI_ADMIN_KEY": "hostile-admin",
+    "OPENAI_ORG_ID": "hostile-organization",
+    "OPENAI_PROJECT_ID": "hostile-project",
+    "OPENAI_WEBHOOK_SECRET": "hostile-webhook",
+    "OPENAI_CUSTOM_HEADERS": (
+        "X-Injected: hostile-header\nAuthorization: Bearer hostile"
+    ),
+}
 
 
 class RecordingCompletions:
@@ -67,6 +80,74 @@ def _provider_response(
     )
 
 
+def _patch_recording_http_transport(monkeypatch):
+    captured: dict[str, object] = {}
+    real_http_client = httpx.Client
+
+    def handle_request(request: httpx.Request) -> httpx.Response:
+        captured["request"] = request
+        return httpx.Response(
+            200,
+            request=request,
+            json={
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "model-a",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "answer",
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 8,
+                    "completion_tokens": 2,
+                    "total_tokens": 10,
+                },
+            },
+        )
+
+    def build_http_client(**kwargs):
+        captured["http_kwargs"] = kwargs
+        return real_http_client(
+            transport=httpx.MockTransport(handle_request),
+            timeout=kwargs["timeout"],
+            limits=kwargs["limits"],
+            trust_env=False,
+        )
+
+    monkeypatch.setattr(
+        openrouter,
+        "httpx",
+        SimpleNamespace(
+            Client=build_http_client,
+            Limits=httpx.Limits,
+            Timeout=httpx.Timeout,
+        ),
+    )
+    return captured
+
+
+def _set_hostile_openai_environment(monkeypatch):
+    for name in PROXY_ENV_VARIABLES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
+    for name, value in UNRELATED_OPENAI_ENV.items():
+        monkeypatch.setenv(name, value)
+
+
+def _client_config():
+    return {
+        "openrouter": {"base_url": "https://openrouter.ai/api/v1"},
+        "cost_tracking": {"enabled": False},
+    }
+
+
 def test_openrouter_adapter_module_exists():
     assert importlib.util.find_spec("rl_skill_edit.adapters.openrouter") is not None
 
@@ -91,7 +172,58 @@ def test_client_requires_api_key(monkeypatch):
         )
 
 
-def test_client_disables_sdk_retries_and_uses_explicit_proxy_env(
+def test_unrelated_openai_environment_does_not_configure_client(monkeypatch):
+    _set_hostile_openai_environment(monkeypatch)
+    _patch_recording_http_transport(monkeypatch)
+
+    client = OpenRouterClient(_client_config())
+
+    for attribute in (
+        "admin_api_key",
+        "organization",
+        "project",
+        "webhook_secret",
+    ):
+        assert getattr(client.client, attribute, None) not in set(
+            UNRELATED_OPENAI_ENV.values()
+        )
+    default_headers = getattr(client.client, "default_headers", {})
+    assert "X-Injected" not in default_headers
+    for name, value in UNRELATED_OPENAI_ENV.items():
+        assert os.environ[name] == value
+
+
+def test_unrelated_openai_environment_cannot_inject_request_headers(
+    monkeypatch,
+):
+    _set_hostile_openai_environment(monkeypatch)
+    captured = _patch_recording_http_transport(monkeypatch)
+    client = OpenRouterClient(_client_config())
+
+    text, usage = client.chat(
+        model="model-a",
+        messages=[{"role": "user", "content": "question"}],
+    )
+
+    request = captured["request"]
+    assert isinstance(request, httpx.Request)
+    assert text == "answer"
+    assert usage["ok"] is True
+    assert request.headers["Authorization"] == "Bearer test-openrouter-key"
+    assert "X-Injected" not in request.headers
+    assert "OpenAI-Organization" not in request.headers
+    assert "OpenAI-Project" not in request.headers
+    assert json.loads(request.content) == {
+        "model": "model-a",
+        "messages": [{"role": "user", "content": "question"}],
+        "temperature": 0.0,
+        "max_tokens": 2048,
+    }
+    for name, value in UNRELATED_OPENAI_ENV.items():
+        assert os.environ[name] == value
+
+
+def test_client_uses_explicit_proxy_env_and_disables_ambient_httpx_env(
     monkeypatch,
 ):
     for name in PROXY_ENV_VARIABLES:
@@ -99,19 +231,13 @@ def test_client_disables_sdk_retries_and_uses_explicit_proxy_env(
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     monkeypatch.setenv("HTTPS_PROXY", "http://environment-proxy:8080")
     fake_http_client = object()
-    fake_provider = object()
     captured: dict[str, dict] = {}
 
     def build_http_client(**kwargs):
         captured["http"] = kwargs
         return fake_http_client
 
-    def build_provider(**kwargs):
-        captured["provider"] = kwargs
-        return fake_provider
-
     monkeypatch.setattr(httpx, "Client", build_http_client)
-    monkeypatch.setattr(openrouter, "OpenAI", build_provider, raising=False)
 
     client = OpenRouterClient(
         {
@@ -125,13 +251,6 @@ def test_client_disables_sdk_retries_and_uses_explicit_proxy_env(
 
     assert captured["http"]["proxy"] == "http://environment-proxy:8080"
     assert captured["http"]["trust_env"] is False
-    assert captured["provider"] == {
-        "api_key": "test-key",
-        "base_url": "https://openrouter.ai/api/v1",
-        "http_client": fake_http_client,
-        "max_retries": 0,
-    }
-    assert client.client is fake_provider
     assert client.extra_headers == {
         "HTTP-Referer": "http://localhost",
         "X-Title": "RL-Skill-Edit",
@@ -253,6 +372,41 @@ def test_incomplete_provider_response_fails_closed_and_is_recorded(response):
     assert client.cost_summary()["total_calls"] == 1
 
 
+@pytest.mark.parametrize(
+    "choices",
+    (
+        {"unexpected": "mapping"},
+        7,
+        [None],
+        [7],
+    ),
+)
+def test_malformed_choices_fail_closed_and_preserve_usage(choices):
+    response = SimpleNamespace(
+        choices=choices,
+        usage=SimpleNamespace(
+            prompt_tokens=8,
+            completion_tokens=2,
+            total_tokens=10,
+        ),
+    )
+    client, completions = _bare_client(response=response)
+
+    text, usage = client.chat(
+        model="model-a",
+        messages=[{"role": "user", "content": "question"}],
+    )
+
+    assert len(completions.calls) == 1
+    assert text == ""
+    assert usage["ok"] is False
+    assert usage["error_kind"] == "empty_response"
+    assert usage["input_tokens"] == 8
+    assert usage["output_tokens"] == 2
+    assert usage["total_tokens"] == 10
+    assert client.cost_summary()["total_tokens"] == 10
+
+
 def test_empty_text_response_preserves_provider_usage():
     client, completions = _bare_client(
         response=_provider_response(text=""),
@@ -333,6 +487,106 @@ def test_missing_model_price_fails_closed_before_provider_request():
     assert usage["ok"] is False
     assert usage["error_kind"] == "configuration_error"
     assert client.cost_summary()["total_calls"] == 1
+
+
+def test_unrepresentable_model_price_fails_closed_before_provider_request():
+    client, completions = _bare_client(
+        response=_provider_response(),
+        config={
+            "cost_tracking": {
+                "enabled": True,
+                "cost_per_1k_tokens": {"model-a": 10**400},
+            }
+        },
+    )
+
+    text, usage = client.chat(
+        model="model-a",
+        messages=[{"role": "user", "content": "question"}],
+    )
+
+    assert completions.calls == []
+    assert text == ""
+    assert usage["ok"] is False
+    assert usage["error_kind"] == "configuration_error"
+    assert client.cost_summary()["total_calls"] == 1
+    assert client.cost_summary()["total_cost_usd"] == 0.0
+
+
+@pytest.mark.parametrize(
+    ("input_tokens", "output_tokens", "price"),
+    (
+        pytest.param(10**400, 0, 1.0, id="token-float-overflow"),
+        pytest.param(1000, 1000, 1e308, id="nonfinite-product"),
+    ),
+)
+def test_nonfinite_calculated_cost_fails_closed_and_preserves_tokens(
+    input_tokens, output_tokens, price
+):
+    client, completions = _bare_client(
+        response=_provider_response(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        ),
+        config={
+            "cost_tracking": {
+                "enabled": True,
+                "cost_per_1k_tokens": {"model-a": price},
+            }
+        },
+    )
+
+    text, usage = client.chat(
+        model="model-a",
+        messages=[{"role": "user", "content": "question"}],
+    )
+
+    assert len(completions.calls) == 1
+    assert text == ""
+    assert usage["ok"] is False
+    assert usage["error_kind"] == "invalid_cost"
+    assert usage["input_tokens"] == input_tokens
+    assert usage["output_tokens"] == output_tokens
+    assert usage["total_tokens"] == input_tokens + output_tokens
+    assert usage["cost_usd"] == 0.0
+    summary = client.cost_summary()
+    assert summary["total_calls"] == 1
+    assert summary["total_tokens"] == input_tokens + output_tokens
+    assert summary["total_cost_usd"] == 0.0
+
+
+def test_nonfinite_accumulated_cost_marks_the_current_call_failed():
+    client, completions = _bare_client(
+        response=_provider_response(input_tokens=1000, output_tokens=1000),
+        config={
+            "cost_tracking": {
+                "enabled": True,
+                "cost_per_1k_tokens": {"model-a": 5e307},
+            }
+        },
+    )
+
+    first_text, first_usage = client.chat(
+        model="model-a",
+        messages=[{"role": "user", "content": "first"}],
+    )
+    second_text, second_usage = client.chat(
+        model="model-a",
+        messages=[{"role": "user", "content": "second"}],
+    )
+
+    assert len(completions.calls) == 2
+    assert first_text == "answer"
+    assert first_usage["ok"] is True
+    assert second_text == ""
+    assert second_usage["ok"] is False
+    assert second_usage["error_kind"] == "invalid_cost"
+    assert second_usage["total_tokens"] == 2000
+    assert second_usage["cost_usd"] == 0.0
+    summary = client.cost_summary()
+    assert summary["total_calls"] == 2
+    assert summary["total_tokens"] == 4000
+    assert math.isfinite(summary["total_cost_usd"])
 
 
 def test_parallel_usage_accounting_is_atomic():
