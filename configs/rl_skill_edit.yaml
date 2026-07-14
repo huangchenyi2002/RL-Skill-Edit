@@ -1,27 +1,37 @@
 method: rl_skill_edit
-runtime: repository
+runtime: spreadsheet
 seed: 42
-methods:
-  - initial_skill
-  # Requires the three archived files under paths.current_* below.
-  - current_method
-  - rl_skill_edit
+
+openrouter:
+  base_url: https://openrouter.ai/api/v1
+
+cost_tracking:
+  enabled: true
+  cost_per_1k_tokens:
+    anthropic/claude-3-haiku: 0.0008
+    anthropic/claude-opus-4.5: 0.015
+
+student:
+  model: anthropic/claude-3-haiku
+  temperature: 0.0
+  max_tokens: 4096
+  max_steps: 3
+
+editor:
+  model: anthropic/claude-opus-4.5
+  temperature: 0.0
+  max_tokens: 4096
 
 skill_identity:
   skill_id: main
   name: main
-  description: "\uFEFF# Spreadsheet Manipulation Skill (Haiku-optimized)"
+  description: Spreadsheet manipulation skill optimized by RL-Skill-Edit.
 
 paths:
-  repository_config: config.yaml
   initial_skill: data/spreadsheet/SKILL.md
   train_manifest: data/spreadsheetbench/splits/dev_pool.json
   validation_manifest: data/spreadsheetbench/splits/witness.json
   test_manifest: data/spreadsheetbench/splits/test.json
-  # Optional external archive used only when current_method is requested.
-  current_skill: ../result/spreadsheet/SKILL.md
-  current_history: ../result/spreadsheet/study1_history_20260714_012206.json
-  current_jsonl: ../result/spreadsheet/study1_20260714_012206.jsonl
   output_dir: results/rl_skill_edit
   rl_skill: results/rl_skill_edit/rl_skill_edit/best_rl_skill.md
   rl_summary: results/rl_skill_edit/rl_skill_edit/rl_optimization_summary.json
@@ -73,27 +83,9 @@ evaluation:
   paired_tasks: true
   save_task_level_results: true
   blind: true
-  parallel: true
-  workers: 4
 
-models:
-  student:
-    model: anthropic/claude-3-haiku
-    temperature: 0.0
-    max_tokens: 4096
-    max_steps: 3
-  editor:
-    model: anthropic/claude-opus-4.5
-    temperature: 0.0
-    max_tokens: 4096
-
-# Matches the observed 2026-07-14 optimization scope closely:
-# current method used 2,760 optimization rollouts plus 60 archived Final
-# rollouts, 25 Editor calls, and 12 rounds. RL can reach 2,748 rollouts.
 budget:
   student_rollouts: 2760
-  teacher_rollouts: 0
-  reference_rollouts: 0
   editor_calls: 25
   evaluator_calls: 73
   input_tokens: 55000000

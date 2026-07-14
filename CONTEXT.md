@@ -1,5 +1,5 @@
 # CONTEXT
 
-- 当前内容：RL-Skill-Edit 独立发布仓库，包含 API-free smoke、真实运行配置、复用的 OSD runtime 和验证测试。
-- 当前状态：首个可发布版本已整理完成并通过本地验证；默认发布分支为 `kaggle_data`。
-- 关键决定：只发布可复现代码和公开 mock 数据；本地结果、私有 SpreadsheetBench 数据、缓存、密钥及源项目中无关的实验计划均不发布。
+- 当前内容：仓库已改为唯一 `RL-Skill-Edit` CLI；`initial_skill` 只作为输入和配对报告基线。
+- 当前状态：Task 5 已完成单流程训练、事务冻结、严格 provenance、`--test-only` 和 API-free smoke；下一步清理剩余旧 OSD 文件与文档。
+- 关键决定：依赖文件统一为 `requirements.txt`；训练先写 staging bundle，所有持久化路径使用 bundle 内相对路径，完整成功后才替换既有冻结结果。

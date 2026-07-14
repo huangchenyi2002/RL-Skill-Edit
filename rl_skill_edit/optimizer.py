@@ -286,8 +286,12 @@ class RLSkillEditOptimizer:
                     log_row = {
                         "episode": episode,
                         "step": step,
-                        "current_skill_path": str(current_skill_path),
-                        "candidate_skill_path": str(current_skill_path),
+                        "current_skill_path": self._artifact_reference(
+                            current_skill_path
+                        ),
+                        "candidate_skill_path": self._artifact_reference(
+                            current_skill_path
+                        ),
                         "action_index": action.index,
                         "module_id": action.module_id,
                         "operator": action.operator.value,
@@ -440,8 +444,10 @@ class RLSkillEditOptimizer:
                 log_row = {
                     "episode": episode,
                     "step": step,
-                    "current_skill_path": str(current_skill_path),
-                    "candidate_skill_path": str(candidate_skill_path),
+                    "current_skill_path": self._artifact_reference(current_skill_path),
+                    "candidate_skill_path": self._artifact_reference(
+                        candidate_skill_path
+                    ),
                     "action_index": action.index,
                     "module_id": action.module_id,
                     "operator": action.operator.value,
@@ -518,10 +524,18 @@ class RLSkillEditOptimizer:
                     "termination": termination,
                     "best_validation_score": best_validation_score,
                     "best_skill_digest": best_skill.digest,
-                    "final_skill_path": str(episode_dir / "final_skill.md"),
-                    "best_skill_path": str(episode_dir / "best_validation_skill.md"),
-                    "policy_checkpoint_path": str(episode_dir / "policy_checkpoint.pt"),
-                    "trajectory_path": str(episode_dir / "edit_trajectory.json"),
+                    "final_skill_path": self._artifact_reference(
+                        episode_dir / "final_skill.md"
+                    ),
+                    "best_skill_path": self._artifact_reference(
+                        episode_dir / "best_validation_skill.md"
+                    ),
+                    "policy_checkpoint_path": self._artifact_reference(
+                        episode_dir / "policy_checkpoint.pt"
+                    ),
+                    "trajectory_path": self._artifact_reference(
+                        episode_dir / "edit_trajectory.json"
+                    ),
                     **update_metrics,
                 }
             )
@@ -650,6 +664,9 @@ class RLSkillEditOptimizer:
             "elapsed_seconds": float(usage.get("elapsed_s", editor_elapsed)),
         }
         budget.record_editor(reservation, **kwargs)
+
+    def _artifact_reference(self, path: Path) -> str:
+        return path.relative_to(self.output_dir).as_posix()
 
     @staticmethod
     def _append_log(path: Path, payload: dict[str, Any]) -> None:
