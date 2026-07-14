@@ -17,11 +17,16 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _canonical_task_fingerprint(task: dict[str, Any]) -> str:
+def _canonical_task_fingerprint(
+    task: dict[str, Any],
+    *,
+    init_sha256: str,
+    golden_sha256: str,
+) -> str:
     spreadsheet = task["spreadsheet"]
     identity = {
-        "init_sha256": _sha256_file(Path(spreadsheet["init_file"])),
-        "golden_sha256": _sha256_file(Path(spreadsheet["golden_file"])),
+        "init_sha256": init_sha256,
+        "golden_sha256": golden_sha256,
         "answer_sheet": str(spreadsheet.get("answer_sheet", "")),
         "answer_position": str(spreadsheet.get("answer_position", "")),
     }
@@ -57,6 +62,8 @@ class TaskManifest:
     tasks: tuple[dict[str, Any], ...]
     ordered_task_ids: tuple[str, ...]
     task_fingerprints: tuple[str, ...]
+    init_workbook_fingerprints: tuple[str, ...]
+    golden_workbook_fingerprints: tuple[str, ...]
     task_content_fingerprints: tuple[str, ...]
     digest: str
 
@@ -80,6 +87,8 @@ class TaskManifest:
         tasks: list[dict[str, Any]] = []
         task_ids: list[str] = []
         fingerprints: list[str] = []
+        init_workbook_fingerprints: list[str] = []
+        golden_workbook_fingerprints: list[str] = []
         content_fingerprints: list[str] = []
         seen_ids: set[str] = set()
         seen_fingerprints: set[str] = set()
@@ -111,13 +120,21 @@ class TaskManifest:
             task = dict(raw_task)
             task["task_id"] = task_id
             task["spreadsheet"] = spreadsheet
-            fingerprint = _canonical_task_fingerprint(task)
+            init_workbook_fingerprint = _sha256_file(Path(spreadsheet["init_file"]))
+            golden_workbook_fingerprint = _sha256_file(Path(spreadsheet["golden_file"]))
+            fingerprint = _canonical_task_fingerprint(
+                task,
+                init_sha256=init_workbook_fingerprint,
+                golden_sha256=golden_workbook_fingerprint,
+            )
             if fingerprint in seen_fingerprints:
                 raise ValueError(
                     f"duplicate canonical task entity in {split.value}: {task_id}"
                 )
             seen_fingerprints.add(fingerprint)
             fingerprints.append(fingerprint)
+            init_workbook_fingerprints.append(init_workbook_fingerprint)
+            golden_workbook_fingerprints.append(golden_workbook_fingerprint)
             content_fingerprint = _task_content_fingerprint(task, fingerprint)
             task["_entity_fingerprint"] = fingerprint
             task["_content_fingerprint"] = content_fingerprint
@@ -130,6 +147,8 @@ class TaskManifest:
                 "split": split.value,
                 "task_ids": task_ids,
                 "fingerprints": fingerprints,
+                "init_workbook_fingerprints": init_workbook_fingerprints,
+                "golden_workbook_fingerprints": golden_workbook_fingerprints,
                 "content_fingerprints": content_fingerprints,
             },
             sort_keys=True,
@@ -141,6 +160,8 @@ class TaskManifest:
             tasks=tuple(tasks),
             ordered_task_ids=tuple(task_ids),
             task_fingerprints=tuple(fingerprints),
+            init_workbook_fingerprints=tuple(init_workbook_fingerprints),
+            golden_workbook_fingerprints=tuple(golden_workbook_fingerprints),
             task_content_fingerprints=tuple(content_fingerprints),
             digest=hashlib.sha256(digest_payload).hexdigest(),
         )
@@ -168,6 +189,17 @@ def validate_manifests(*manifests: TaskManifest) -> None:
             if fingerprint_overlap:
                 raise ValueError(
                     f"canonical task overlap between {left.split.value} "
+                    f"and {right.split.value}"
+                )
+            left_workbook_fingerprints = set(left.init_workbook_fingerprints) | set(
+                left.golden_workbook_fingerprints
+            )
+            right_workbook_fingerprints = set(right.init_workbook_fingerprints) | set(
+                right.golden_workbook_fingerprints
+            )
+            if left_workbook_fingerprints & right_workbook_fingerprints:
+                raise ValueError(
+                    f"workbook content overlap between {left.split.value} "
                     f"and {right.split.value}"
                 )
 

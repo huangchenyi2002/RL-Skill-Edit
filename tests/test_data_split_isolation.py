@@ -178,6 +178,33 @@ def test_canonical_alias_cannot_hide_behind_reworded_description(
         )
 
 
+@pytest.mark.parametrize(
+    ("source_field", "target_field"),
+    [
+        ("init_file", "init_file"),
+        ("golden_file", "golden_file"),
+        ("init_file", "golden_file"),
+    ],
+)
+def test_workbook_content_overlap_cannot_hide_behind_changed_answer_range(
+    tmp_path: Path,
+    source_field: str,
+    target_field: str,
+) -> None:
+    train_task = _make_task(tmp_path, "train-id", "shared-workbooks")
+    validation_task = _make_task(tmp_path, "validation-id", "validation")
+    test_task = _make_task(tmp_path, "test-id", "unused-test-workbooks")
+    test_task["spreadsheet"][target_field] = train_task["spreadsheet"][source_field]
+    test_task["spreadsheet"]["answer_position"] = "B2"
+
+    with pytest.raises(ValueError, match="workbook content overlap"):
+        validate_manifests(
+            _load(tmp_path, Split.TRAIN, [train_task]),
+            _load(tmp_path, Split.VALIDATION, [validation_task]),
+            _load(tmp_path, Split.TEST, [test_task]),
+        )
+
+
 def test_manifest_rejects_duplicate_canonical_entities_inside_one_split(
     tmp_path: Path,
 ) -> None:
