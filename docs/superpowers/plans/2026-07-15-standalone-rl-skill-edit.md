@@ -38,18 +38,14 @@
 - [ ] **Step 1: Write the package-boundary test**
 
 ```python
+import importlib.util
 from pathlib import Path
-
-import rl_skill_edit
-from rl_skill_edit.optimizer import RLSkillEditOptimizer
-
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_rl_is_the_top_level_package():
-    assert rl_skill_edit.__file__
-    assert RLSkillEditOptimizer.__module__ == "rl_skill_edit.optimizer"
+    assert importlib.util.find_spec("rl_skill_edit") is not None
     assert not (ROOT / "baselines").exists()
 ```
 
@@ -57,7 +53,7 @@ def test_rl_is_the_top_level_package():
 
 Run: `.venv/bin/python -B -m pytest -p no:cacheprovider tests/test_repository_boundary.py -v`
 
-Expected: FAIL because `rl_skill_edit` does not exist yet.
+Expected: FAIL by assertion because `rl_skill_edit` is absent and `baselines/` exists; test collection succeeds.
 
 - [ ] **Step 3: Move the package and rewrite retained imports mechanically**
 
@@ -110,24 +106,20 @@ git commit -m "refactor: promote RL package"
 - [ ] **Step 1: Point the accounting test at the future adapter**
 
 ```python
-from rl_skill_edit.adapters.openrouter import OpenRouterClient
+import importlib.util
 
 
-def test_parallel_usage_accounting_is_atomic():
-    client = OpenRouterClient.__new__(OpenRouterClient)
-    client.total_input_tokens = 0
-    client.total_output_tokens = 0
-    client.total_cost_usd = 0.0
-    client.call_log = []
-    client._initialize_usage_lock()
-    # Keep the existing 1,000 parallel _record_call assertions.
+def test_openrouter_adapter_module_exists():
+    assert importlib.util.find_spec(
+        "rl_skill_edit.adapters.openrouter"
+    ) is not None
 ```
 
 - [ ] **Step 2: Run the test and verify the adapter is missing**
 
 Run: `.venv/bin/python -B -m pytest -p no:cacheprovider tests/test_client_usage_accounting.py -v`
 
-Expected: FAIL with `ModuleNotFoundError: rl_skill_edit.adapters`.
+Expected: FAIL by assertion because the adapter module is absent; test collection succeeds.
 
 - [ ] **Step 3: Implement the minimal client**
 
@@ -147,6 +139,12 @@ response = self.client.chat.completions.create(**request)
 ```
 
 It must read only `OPENROUTER_API_KEY`, optional proxy variables, and RL config; record input/output tokens and cost under a lock; make one provider request; and return an explicit `ok=False` usage object on provider failure. Set the default app title to `RL-Skill-Edit`. Do not copy Teacher-specific comments, retry loops, or Study configuration.
+
+Then point the existing accounting test at the adapter:
+
+```python
+from rl_skill_edit.adapters.openrouter import OpenRouterClient
+```
 
 - [ ] **Step 4: Type the Editor against the shared chat surface**
 
@@ -185,7 +183,61 @@ git commit -m "refactor: add standalone OpenRouter client"
 - Consumes: `SkillArtifact`, a SpreadsheetBench task mapping, `OpenRouterClient`, and frozen Student configuration.
 - Produces: `StudentTrajectory`, `SpreadsheetExecutor`, `SpreadsheetStudent.run_task(task, skill, blind, seed)`, and `SpreadsheetSkillEvaluator.evaluate(...) -> EvaluationBatch`.
 
-- [ ] **Step 1: Write failing forced-skill and blind-Test tests**
+- [ ] **Step 1: Write a failing adapter-boundary test**
+
+```python
+import importlib.util
+
+
+def test_spreadsheet_adapter_module_exists():
+    assert importlib.util.find_spec(
+        "rl_skill_edit.adapters.spreadsheet"
+    ) is not None
+```
+
+- [ ] **Step 2: Run the boundary test and verify a clean assertion failure**
+
+Run: `.venv/bin/python -B -m pytest -p no:cacheprovider tests/test_blind_final_evaluation.py::test_spreadsheet_adapter_module_exists -v`
+
+Expected: FAIL by assertion because the adapter module is absent; test collection succeeds.
+
+- [ ] **Step 3: Create only the runtime API skeleton**
+
+Create the records below and `SpreadsheetExecutor`/`SpreadsheetStudent` method signatures. Their behavior methods must raise `NotImplementedError`; this is the minimum code needed to satisfy the module-boundary test and make the behavior test collect.
+
+```python
+@dataclass(frozen=True)
+class ExecutionResult:
+    score: float
+    matched: int
+    total: int
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class StudentTrajectory:
+    task_id: str
+    hard_reward: float
+    soft_reward: float
+    final_answer: str
+    visible_logs: tuple[str, ...]
+    total_tokens: int
+    total_cost_usd: float
+    evaluation_valid: bool = True
+    invalid_reason: str = ""
+
+
+class SpreadsheetStudent:
+    def __init__(self, config: Mapping[str, Any], client: Any) -> None:
+        self.executor = SpreadsheetExecutor()
+
+    def run_task(
+        self, task: Mapping[str, Any], skill: SkillArtifact, *, blind: bool, seed: int
+    ) -> StudentTrajectory:
+        raise NotImplementedError
+```
+
+- [ ] **Step 4: Replace old blind tests with failing forced-skill behavior tests**
 
 ```python
 from rl_skill_edit.adapters.spreadsheet import ExecutionResult, SpreadsheetStudent
@@ -220,13 +272,13 @@ def test_student_has_no_implicit_or_no_skill_entrypoints():
     assert not hasattr(SpreadsheetStudent, "run_task_with_model")
 ```
 
-- [ ] **Step 2: Run the blind test and verify the new runtime is missing**
+- [ ] **Step 5: Run the blind behavior test and verify the skeleton fails**
 
 Run: `.venv/bin/python -B -m pytest -p no:cacheprovider tests/test_blind_final_evaluation.py -v`
 
-Expected: FAIL with missing `rl_skill_edit.adapters.spreadsheet`.
+Expected: FAIL at `SpreadsheetStudent.run_task` with `NotImplementedError`.
 
-- [ ] **Step 3: Implement focused runtime records and executor**
+- [ ] **Step 6: Implement focused runtime records and executor**
 
 Use these records:
 
@@ -254,7 +306,7 @@ class StudentTrajectory:
 
 `SpreadsheetExecutor.execute_and_score` must copy the input workbook to a temporary directory, run extracted Python with only `PATH`, `PYTHONIOENCODING`, and `PYTHONDONTWRITEBYTECODE`, enforce the existing eight-second timeout, and compare the configured golden sheet/range. Empty code, missing files/range, timeout, import failure, or nonzero subprocess exit returns an explicit invalid result. Do not auto-insert `wb.save(...)` and do not compute heuristic reward.
 
-- [ ] **Step 4: Implement the forced-skill Student**
+- [ ] **Step 7: Implement the forced-skill Student**
 
 The only prompt path is:
 
@@ -274,7 +326,7 @@ response, usage = self.client.chat(
 
 For `blind=True`, make exactly one model call and never return score/verifier feedback to the model. For Train/Validation, bounded retries may use only execution error text, not golden answer values. An empty response or missing executable code is `evaluation_valid=False`.
 
-- [ ] **Step 5: Localize score selection and implement ordered evaluation**
+- [ ] **Step 8: Localize score selection and implement ordered evaluation**
 
 Remove `from src.evaluator import select_gate_score` and define:
 
@@ -292,17 +344,17 @@ def select_score(hard: float, soft: float, metric: str, mixed_weight: float) -> 
 
 `SpreadsheetSkillEvaluator` must preserve task order, derive each rollout seed as `seed + task_index * repetitions + repetition`, reject an incomplete bundle, enforce freeze-before-Test, and use the existing cache identity.
 
-- [ ] **Step 6: Remove SkillLibrary conversion**
+- [ ] **Step 9: Remove SkillLibrary conversion**
 
 Delete `SkillArtifact.to_library()` from `types.py`. The real evaluator receives `SkillArtifact` directly.
 
-- [ ] **Step 7: Run runtime, isolation, and optimizer tests**
+- [ ] **Step 10: Run runtime, isolation, and optimizer tests**
 
 Run: `.venv/bin/python -B -m pytest -p no:cacheprovider tests/test_blind_final_evaluation.py tests/test_data_split_isolation.py tests/test_rl_skill_edit_optimizer.py -v`
 
 Expected: PASS.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 11: Commit**
 
 ```bash
 git add rl_skill_edit/evaluation.py rl_skill_edit/types.py rl_skill_edit/adapters/spreadsheet.py tests/test_blind_final_evaluation.py
@@ -324,9 +376,15 @@ git commit -m "feat: add standalone spreadsheet runtime"
 - Consumes: initial and frozen RL `SkillArtifact`, one frozen evaluator, task bundle, and two usage mappings.
 - Produces: `BudgetSnapshot` with RL-only counters and `run_frozen_report(initial_skill, rl_skill, evaluator, test_tasks, output_dir, seed, repetitions, bootstrap_samples)`.
 
-- [ ] **Step 1: Write failing RL-only budget assertions**
+- [ ] **Step 1: Write failing RL-only budget and reporting-module assertions**
+
+Create `tests/test_reporting.py` for the reporting assertion; keep the old comparison
+test untouched until Step 3 so this first RED run still collects cleanly.
 
 ```python
+import importlib.util
+
+
 def test_budget_accepts_only_rl_resources():
     ledger = BudgetLedger(
         {
@@ -341,11 +399,30 @@ def test_budget_accepts_only_rl_resources():
     snapshot = ledger.snapshot().to_dict()
     assert "teacher_rollouts" not in snapshot
     assert "reference_rollouts" not in snapshot
+
+
+def test_reporting_module_exists():
+    assert importlib.util.find_spec("rl_skill_edit.reporting") is not None
 ```
 
-- [ ] **Step 2: Write failing two-artifact reporting assertions**
+- [ ] **Step 2: Run RED for the old budget and missing reporting module**
+
+Run: `.venv/bin/python -B -m pytest -p no:cacheprovider tests/test_budget_accounting.py tests/test_reporting.py -v`
+
+Expected: FAIL by assertions because old budget fields exist and `reporting.py` is absent; test collection succeeds.
+
+- [ ] **Step 3: Move comparison to reporting without changing behavior**
+
+Run: `git mv rl_skill_edit/comparison.py rl_skill_edit/reporting.py`
+
+Update imports that still reference `rl_skill_edit.comparison`. Do not add `run_frozen_report` yet.
+
+- [ ] **Step 4: Add the failing two-artifact reporting assertion**
 
 ```python
+import rl_skill_edit.reporting as reporting
+
+
 class FrozenEvaluator:
     def __init__(self) -> None:
         self.frozen = False
@@ -367,7 +444,8 @@ class FrozenEvaluator:
 
 
 def test_frozen_report_evaluates_only_initial_and_rl(tmp_path):
-    result = run_frozen_report(
+    assert callable(getattr(reporting, "run_frozen_report", None))
+    result = reporting.run_frozen_report(
         initial_skill=_skill("initial_skill", "INITIAL"),
         rl_skill=_skill("rl_skill_edit", "RL"),
         evaluator=FrozenEvaluator(),
@@ -385,13 +463,13 @@ def test_frozen_report_evaluates_only_initial_and_rl(tmp_path):
     ]
 ```
 
-- [ ] **Step 3: Run focused tests and confirm old fields/methods fail them**
+- [ ] **Step 5: Run RED for the absent fixed reporting function**
 
 Run: `.venv/bin/python -B -m pytest -p no:cacheprovider tests/test_budget_accounting.py tests/test_reporting.py -v`
 
-Expected: FAIL because the old ledger/reporting still exposes other methods.
+Expected: FAIL by assertion because `run_frozen_report` is absent and because the old ledger still exposes other method fields.
 
-- [ ] **Step 4: Simplify the budget ledger**
+- [ ] **Step 6: Simplify the budget ledger**
 
 Set structural limits to:
 
@@ -412,7 +490,7 @@ reservation = budget.reserve_evaluation(
 )
 ```
 
-- [ ] **Step 5: Rewrite reporting for exactly two artifacts**
+- [ ] **Step 7: Rewrite reporting for exactly two artifacts**
 
 Retain paired bootstrap/statistics and CSV writers, but expose only:
 
@@ -435,17 +513,17 @@ def run_frozen_report(
 
 Freeze first; evaluate initial then RL with `use_cache=False` and `blind=True`; write only two method rows and `2 * len(test_tasks)` task rows. Delete `ImportedMethod`, current archive parsing, generic method registry, and Teacher/Reference columns.
 
-- [ ] **Step 6: Remove random search and update optimizer tests**
+- [ ] **Step 8: Remove random search and update optimizer tests**
 
 Delete `random_policy.py`. Replace assertions about zero Teacher/Reference budgets with assertions that the public snapshot keys are exactly the RL counters.
 
-- [ ] **Step 7: Run budget/reporting/optimizer tests**
+- [ ] **Step 9: Run budget/reporting/optimizer tests**
 
 Run: `.venv/bin/python -B -m pytest -p no:cacheprovider tests/test_budget_accounting.py tests/test_reporting.py tests/test_rl_skill_edit_optimizer.py -v`
 
 Expected: PASS.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 10: Commit**
 
 ```bash
 git add rl_skill_edit tests
@@ -468,7 +546,36 @@ git commit -m "refactor: keep only RL budget and reporting"
 - Consumes: a self-contained RL YAML config.
 - Produces: `parse_args(argv=None)`, `run(config_path: Path, seed: int | None = None, test_only: bool = False) -> dict[str, Any]`, and `python -m rl_skill_edit`.
 
-- [ ] **Step 1: Rewrite the end-to-end test for the fixed workflow**
+- [ ] **Step 1: Write a failing CLI module-boundary test**
+
+```python
+import importlib.util
+
+
+def test_cli_module_exists():
+    assert importlib.util.find_spec("rl_skill_edit.cli") is not None
+```
+
+- [ ] **Step 2: Run the boundary test and verify a clean assertion failure**
+
+Run: `.venv/bin/python -B -m pytest -p no:cacheprovider tests/test_rl_skill_edit_end_to_end.py::test_cli_module_exists -v`
+
+Expected: FAIL by assertion because the CLI module is absent; test collection succeeds.
+
+- [ ] **Step 3: Create only the CLI API skeleton**
+
+Create `parse_args` with the final three flags, create `__main__.py`, and define:
+
+```python
+def run(
+    config_path: Path,
+    seed: int | None = None,
+    test_only: bool = False,
+) -> dict[str, Any]:
+    raise NotImplementedError
+```
+
+- [ ] **Step 4: Rewrite the end-to-end test for the fixed workflow**
 
 ```python
 from rl_skill_edit.cli import run
@@ -507,13 +614,13 @@ def test_api_free_training_and_test_only_report_initial_and_rl(tmp_path):
     assert "current_method_artifact_provenance" not in manifest
 ```
 
-- [ ] **Step 2: Run the end-to-end test and confirm the single CLI is absent**
+- [ ] **Step 5: Run the end-to-end test and verify the skeleton fails**
 
 Run: `.venv/bin/python -B -m pytest -p no:cacheprovider tests/test_rl_skill_edit_end_to_end.py -v`
 
-Expected: FAIL with missing `rl_skill_edit.cli`.
+Expected: FAIL at `run` with `NotImplementedError`.
 
-- [ ] **Step 3: Implement the fixed CLI**
+- [ ] **Step 6: Implement the fixed CLI**
 
 Parser surface:
 
@@ -537,7 +644,7 @@ return sha256_files(files)
 
 Dependency hash must read `requirements.txt`.
 
-- [ ] **Step 4: Make both configs self-contained**
+- [ ] **Step 7: Make both configs self-contained**
 
 Required top-level config mappings:
 
@@ -559,7 +666,7 @@ editor:
 
 Keep RL policy/reward/patch/evaluation/budget/split/path mappings. Remove `methods`, `repository_config`, every `current_*` path, and Teacher/Reference limits.
 
-- [ ] **Step 5: Replace the smoke script**
+- [ ] **Step 8: Replace the smoke script**
 
 ```bash
 #!/usr/bin/env bash
@@ -570,7 +677,7 @@ exec "$ROOT/.venv/bin/python" -m rl_skill_edit \
   --seed 42
 ```
 
-- [ ] **Step 6: Run CLI tests and smoke**
+- [ ] **Step 9: Run CLI tests and smoke**
 
 Run: `.venv/bin/python -B -m pytest -p no:cacheprovider tests/test_rl_skill_edit_end_to_end.py tests/test_data_split_isolation.py -v`
 
@@ -580,7 +687,7 @@ Run: `bash scripts/run_smoke.sh`
 
 Expected: JSON contains exactly `"methods": ["initial_skill", "rl_skill_edit"]` and RL Test reward is greater than initial Test reward.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 10: Commit**
 
 ```bash
 git add -A experiments rl_skill_edit configs scripts tests
