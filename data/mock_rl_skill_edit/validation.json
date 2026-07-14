@@ -1,0 +1,22 @@
+[
+  {
+    "task_id": "mock-validation-0",
+    "description": "Mock validation task zero.",
+    "spreadsheet": {
+      "init_file": "files/validation-0-init.txt",
+      "golden_file": "files/validation-0-golden.txt",
+      "answer_sheet": "Data",
+      "answer_position": "A1"
+    }
+  },
+  {
+    "task_id": "mock-validation-1",
+    "description": "Mock validation task one.",
+    "spreadsheet": {
+      "init_file": "files/validation-1-init.txt",
+      "golden_file": "files/validation-1-golden.txt",
+      "answer_sheet": "Data",
+      "answer_position": "A1"
+    }
+  }
+]

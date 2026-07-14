@@ -1,0 +1,320 @@
+# config/config.yaml
+
+openrouter:
+  base_url: "https://openrouter.ai/api/v1"
+
+student:
+  model: "anthropic/claude-3-haiku"
+  temperature: 0.0
+  max_tokens: 4096
+  max_steps: 3
+
+teacher:
+
+  model: "anthropic/claude-sonnet-4.5"
+  temperature: 0.0
+  max_tokens: 2048
+  max_retries: 3
+
+# ── 新增 LLM 角色 ─────────────────────────────
+parser:
+  model: "anthropic/claude-opus-4.5"
+  temperature: 0.0
+  max_tokens: 8192  # JSON with 10+ labels 需要空间
+  # 拆分 skill 为 modules/groups + 提取 labels Z
+
+expert:
+  model: "anthropic/claude-opus-4.5"
+  temperature: 0.0
+  max_tokens: 4096
+  # 跑额外 rollout 为 label space 提供样本
+
+editor:
+  model: "anthropic/claude-opus-4.5"
+  temperature: 0.0
+  max_tokens: 4096
+  # 基于 g_n 生成 skill edit
+
+paths:
+  library_dir:          "skills"
+  skill_file:           "data/skill/SKILL.md"
+  dev_pool:             "data/spreadsheetbench/splits/dev_pool.json"
+  witness:              "data/spreadsheetbench/splits/witness.json"
+  # final_holdout：只在整个优化结束后评估一次的无偏测试集。
+  # 不参与 gate / early-stop / best selection。
+  # 若为空则用 test.json 作为 fallback（本地已有）。
+  final_holdout:        "data/spreadsheetbench/splits/test.json"
+  test:                 "data/spreadsheetbench/splits/test.json"
+  literacy_probe:       "data/spreadsheetbench/splits/literacy_probe.json"
+  results_study0:       "results/study0"
+  results_study1:       "results/study1"
+  results_study2:       "results/study2"
+  results_study3:       "results/study3"
+  spreadsheetbench_dir: "data/spreadsheetbench_verified_400"
+
+data:
+  # ⚠ 老师 audit（2026-07-10）：dev/witness/final = 60/20/20
+  # 三者互不重叠，final_holdout 只在优化结束后评一次
+  dev_pool_size:        60    # V_n 采样源（Student/Teacher/Ref 都跑这 60）
+  witness_size:         20    # Dual gate 用
+  final_holdout_size:   20    # 结束后评 K_best 一次
+  test_size:            20    # 兼容旧字段，与 final_holdout_size 相同
+  literacy_probe_size:  15
+
+study0:
+  chi_min: 0.40
+
+# ── Study 1：Label-Space ExSkill-OPD 主循环 ──────
+study1:
+  # ── 基础参数 ─────────────────────────────────
+  # ⚡ 加速：B_W 5→3 (每 witness task 重复次数)
+  B_W: 3
+  alpha: 0.10
+  # 当前阶段 reward point estimate 允许的最大回撤 ε_R。
+  reward_epsilon: 0.001
+  B_roll: 5
+  M: 3
+  # N_max 12: 7/06 GOOD 那次是 15 轮跑到第 8 轮才拿到最后一个 accept，
+  # 缩到 8 会失去后期 accept 机会。
+  N_max: 12
+  S_max: 6
+  alpha_attr: 0.1
+  beta_uncovered: 0.3
+  parallel_witness: true
+  # 稳定优先：4 并行 worker
+  # (8 并行经常触发 rate limit / 卡死)
+  witness_workers: 4
+  # ── 采样控制 ─────────────────────────────────
+  # full_pool_every_round=true (2026-07-10 新增):
+  #   每轮 V_n = 整个 dev_pool（60 tasks），
+  #   Teacher/Ref/Student 都跑 60。
+  #   保证 P_T/P_0/λ 估计有足够独立轨迹（30+ 才能
+  #   让 shrinkage 不把 λ 压回 0）。
+  #   Token 消耗 ~6× 正常轮，但方法学最稳。
+  # 关闭时走下面的自适应逻辑（stall/post_accept）。
+  full_pool_every_round: true
+  V_n_stall_min: 20
+  stall_sample_growth: 1.5
+  post_accept_min: 20
+  # ── slow update ──────────────────────────────
+  # ⚠ 暂时禁用（2026-07-10）：slow_update 目前用不到，
+  # 而且它对 label-space 主链没直接贡献（只影响 skill
+  # 的 SLOW_UPDATE 区，不改 execution_body）。
+  # 设 enable_slow_update=false 完全跳过。
+  # 逻辑保留在 try_slow_update() 里，随时可以打开。
+  enable_slow_update: false
+  slow_update_freq: 1
+  slow_update_n_tasks: 20
+  slow_update_min_margin: 0.10
+  slow_update_require_gate: true
+  # ── 编辑类型开关 ─────────────────────────────
+  enable_dispatch_edits: false
+  enable_execution_edits: true
+  enable_scripts: false
+  # ── β 模式 ───────────────────────────────────
+  beta_mode: "b4"
+  beta_value: 1.0
+  # ── 向后兼容的 ρ 步级参数 ────────────────────
+  rho_step_error: 0.5
+  rho_verified: 1.0
+  rho_default: 0.1
+  # ── (m, λ) 参数（老师 §3.2）─────────────────
+  m_min: 0.5
+  m_max: 2.0
+  lambda_min: 0.5
+  lambda_max: 1.6
+  # ── label-space 参数 ─────────────────────────
+  # dirichlet_alpha: 之前 1.0 太重，把 P_T 平滑到偏均匀。
+  # 降到 0.1 让 P_T 保留更多 spike，r_T = log(P_T/P_0)
+  # 在 teacher 强偏好的 label 上有更大差异，λ 投影的
+  # 分母 Σ w·r̃_T² 变大，λ 更容易脱离 0。
+  # （若发现 P_T 太 spike 到不稳定，可回调 0.3-0.5）
+  dirichlet_alpha: 0.1
+  beta_budget: 1.0
+  # ── λ 估计（reward-calibrated projection）──
+  use_reward_calibrated_lambda: true
+  lambda_neutral: 0.0
+  # lambda_neutral=0 保守选择：证据不够退回 P_0
+  # lambda_neutral=1 用于"照抄 teacher" baseline
+  # ── η(h,z) 估计模式 ─────────────────────────
+  # ⚠ 老师 audit（2026-07-10）：主方法必须严格按
+  #   P_0 → P_+ → a_+ = log(P_+/P_0) 计算。
+  #   contrastive 是替代 estimator（边际风险比），
+  #   在 group-level approximation 下也许有更好数值，
+  #   但**不是 Section 2/3 定义的 a_+**，只能作为
+  #   明确命名的 ablation 用。
+  #
+  # occurrence_weighted (主方法, 默认):
+  #   Parser 定义 Skill histories 及其 frozen applicability_patterns。
+  #   一个 rollout action step 可同时适用于多个 Skill histories；
+  #   每个适用 (rollout step, Skill history) 生成一个 observation。
+  #   在每个 Skill history 内恰好一个 z；无 label 命中为 OTHER，
+  #   同一 history 内多 label 命中 fail closed。零 history 命中保留
+  #   为真实-step UNASSIGNED audit。不构造 synthetic observation。
+  #   η_h(z) = 对应 Skill-history records 中 label=z 的平均 Y。
+  #   任一 z 为 zero-support 时该 history 标记 estimable=false：
+  #   不进入 EB，w=0，不生成 g_n/donor，不以全局 reward 插补。
+  #   a_+(z) = log(P_+(z) / P_0(z))
+  #             = log η(z) - log E_{P_0}[η]
+  # presence_weighted (ablation)：
+  #   η(z) = mean{Y_i : z ∈ τ_i}
+  # primary_only (ablation)：
+  #   η(z) = mean{Y_i : primary(τ_i) = z}
+  # contrastive (ablation, 替代 estimator)：
+  #   a_+(z) = log(η_pos / η_neg)
+  #   这不是原始 a_+ 定义，仅供对比
+  eta_mode: "occurrence_weighted"
+  # ── λ 估计模式（Q2 后续补充）──────────────
+  # use_exact_lambda:
+  #   false (默认): WLS 小倾斜近似
+  #     λ_g ≈ Σ w·r̃_T·ã_+ / Σ w·r̃_T²
+  #     + shrinkage B·λ_raw + (1-B)·λ_neutral
+  #     快、有正则，适合 online 迭代
+  #   true (严格):  1D 精确 argmin KL(P_+ ‖ q_ℓ)
+  #     Newton-Raphson on E_{q_ℓ}[r_T] = E_{P_+}[r_T]
+  #     无 shrinkage、无近似，供 ablation 对比
+  # 主方法使用定义本身的一维信息投影；WLS 只作为显式 ablation。
+  use_exact_lambda: true
+  # ── Parser LLM group 控制 ───────────────────
+  # Parser 必须输出 Group→Skill histories 层级；每个 history 有 frozen
+  # applicability_patterns、互斥 label support 和 scoped label patterns。
+  # P/eta/r/a 保持 history-specific；仅 λ 在 Group 内联合估计。
+  # Student/Teacher/Reference 共用同一 ruler 和 valid conditioning。
+  #
+  # 参数
+  # ----
+  # parser_force_single_group=true (稳定, 但粒度粗):
+  #   把 Parser 识别的所有 step 合并成一个 skill-level
+  #   group，只估一个 λ。稳定但只有 G=1 → EB 退化为
+  #   单 group empirical，τ̂² 就是自身 (λ̂ − λ_neu)² − s²。
+  #
+  # parser_force_single_group=false (推荐, 2026-07-11):
+  #   Parser 拆多少 group 就估多少 λ。粒度细，EB 可以
+  #   真正跨 group 聚合估 τ̂²，符合老师 §3.5 原义。
+  #   haiku_v1 SKILL 有 15 个独立 label 通道，Parser
+  #   通常能拆 3-5 组，每组 3-5 label → WLS 分母足够。
+  #
+  # parser_min_labels_per_group=5:
+  #   force_single_group=false 时的兜底：小于此的 group
+  #   fail closed；禁止把不同 design decisions 合并到 misc。
+  parser_force_single_group: false
+  parser_min_labels_per_group: 3
+  # Actual rollout step -> frozen Skill-history mapping is performed by the
+  # Parser LLM after rollouts. One logical batch is deterministically chunked;
+  # any incomplete chunk fails the whole mapping with no regex fallback.
+  parser_mapping_chunk_steps: 30
+  parser_mapping_evidence_chars: 6000
+  # ── gate 参数 ────────────────────────────────
+  gate_metric: "mixed"
+  gate_mixed_weight: 0.5
+  # ── dual gate（老师 §3.4，2026-07-10 audit #5）─
+  # 主实验：真实 KL decrease point > 0 + paired reward point >= -ε_R。
+  # 任一 paired/frozen measurement 缺失时硬拒绝。
+  enable_label_kl_gate: true
+  # ── 学习率调度 ───────────────────────────────
+  lr_schedule: "cosine"
+  lr_max: 5
+  # lr_min 从 2 提到 3：后期至少 3 个候选可选
+  # 避免因提案不够多而 stall
+  lr_min: 3
+  # ── 预算控制 ─────────────────────────────────
+  max_cost_usd: 0
+  # ── minibatch ────────────────────────────────
+  minibatch_size: 3
+  # ── baseline 和 teacher ──────────────────────
+  run_reference_baseline: false
+  reference_baseline_path: "results/study1/reference_baseline.json"
+  teacher_self_execute: false
+  teacher_exec_tasks_n: 10
+  # ── §3.2 Teacher/Reference rollout ──────
+  # teacher_rollout_n=50: 让 P_T 真正区分不同 label
+  # - 30 条时 Dirichlet 平滑后 P_T 仍偏均匀
+  #   → r_T = log P_T - log P_0 在组内近乎常数
+  #   → λ 常触发保守回退 = 0
+  # - 50 条 × 2 步 ≈ 8-12 min (parallel x4)
+  #   Teacher 若 sr=40%，有 20 条成功轨迹，
+  #   P_T 每个 label 的估计方差降到可接受水平
+  teacher_rollout_n: 50
+  ref_rollout_n: 30
+  # ── 消融和诊断 ───────────────────────────────
+  ablation_mode: "full"
+  compute_fn_correlation: true
+  # ── 起始 Library ─────────────────────────────
+  start_library_dir: ""
+  # ── 日志详细度 ───────────────────────────────
+  # dump_prompts=True：把 accept 的 skill 前后完整对比
+  # 落盘到 logs/<run>/prompts/*.txt；同时把 proposal
+  # 的完整 prompt/response 也落盘。磁盘代价较小
+  # （每次 accept 一个 txt），推荐打开。
+  log_dump_prompts: true
+
+# ── Study 2：理论命题验证 ─────────────────────────
+study2:
+  source_study1_result: ""
+  run_point_estimate_ablation: true
+  run_lcb_ablation: true
+  run_no_gate_ablation: true
+  lcb_alpha: 0.10
+  lcb_tau_min: 0.01
+  lcb_bootstrap_samples: 500
+  lcb_B_W: 5
+  compute_false_stall_bound: true
+  verify_monotonicity: true
+  verify_finite_bound: true
+  verify_local_optimality: true
+  verify_false_stall: true
+  beta_history_paths:
+    b1: ""
+    b2: ""
+    b3: ""
+    b4: ""
+
+# ── Study 3：跨模型可迁移性 ───────────────────────
+study3:
+  source_library: ""
+  B_eval: 5
+  target_models:
+    - "openai/gpt-4o"
+    - "openai/gpt-4o-mini"
+    - "anthropic/claude-haiku-4.5"
+    - "google/gemini-flash-1.5"
+  run_dispatch_portability: true
+  run_execution_portability: true
+  compute_gain_retention: true
+  compute_rho_FN_per_model: true
+  run_no_skill_baseline: true
+
+security:
+  deny_patterns:
+    - "exfiltration"
+    - "rm -rf"
+    - "privilege escalation"
+    - "DROP TABLE"
+    - "os.system"
+  allowed_capability_flags:
+    - "file_read"
+    - "file_write"
+    - "network"
+    - "subprocess"
+  residual_risk_budget: 2.0
+
+cost_tracking:
+  enabled: true
+  cost_per_1k_tokens:
+    "openai/gpt-4o-mini":                0.0002
+    "openai/gpt-4o":                     0.005
+    "openai/gpt-4.1":                    0.008
+    "openai/gpt-4.1-mini":               0.0004
+    "openai/gpt-4.1-nano":               0.0001
+    "openai/o3-mini":                    0.002
+    "openai/o4-mini":                    0.003
+    "anthropic/claude-haiku-4.5":        0.0008
+    "anthropic/claude-3-haiku":          0.0008
+    "anthropic/claude-sonnet-4.5":       0.003
+    "anthropic/claude-sonnet-4.6":       0.004
+    "anthropic/claude-sonnet-4":         0.003
+    "anthropic/claude-opus-4.5":         0.015
+    "anthropic/claude-opus-4":           0.015
+    "google/gemini-flash-1.5":           0.0001
+    "meta-llama/llama-3.1-70b-instruct": 0.0004
+    "qwen/qwen-2.5-72b-instruct":       0.0004

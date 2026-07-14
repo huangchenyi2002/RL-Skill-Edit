@@ -1,0 +1,22 @@
+[
+  {
+    "task_id": "mock-train-0",
+    "description": "Mock train task zero.",
+    "spreadsheet": {
+      "init_file": "files/train-0-init.txt",
+      "golden_file": "files/train-0-golden.txt",
+      "answer_sheet": "Data",
+      "answer_position": "A1"
+    }
+  },
+  {
+    "task_id": "mock-train-1",
+    "description": "Mock train task one.",
+    "spreadsheet": {
+      "init_file": "files/train-1-init.txt",
+      "golden_file": "files/train-1-golden.txt",
+      "answer_sheet": "Data",
+      "answer_position": "A1"
+    }
+  }
+]

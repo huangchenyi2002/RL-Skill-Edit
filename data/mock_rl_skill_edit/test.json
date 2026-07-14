@@ -1,0 +1,22 @@
+[
+  {
+    "task_id": "mock-test-0",
+    "description": "Mock test task zero.",
+    "spreadsheet": {
+      "init_file": "files/test-0-init.txt",
+      "golden_file": "files/test-0-golden.txt",
+      "answer_sheet": "Data",
+      "answer_position": "A1"
+    }
+  },
+  {
+    "task_id": "mock-test-1",
+    "description": "Mock test task one.",
+    "spreadsheet": {
+      "init_file": "files/test-1-init.txt",
+      "golden_file": "files/test-1-golden.txt",
+      "answer_sheet": "Data",
+      "answer_position": "A1"
+    }
+  }
+]

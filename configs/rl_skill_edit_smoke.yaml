@@ -1,0 +1,79 @@
+method: rl_skill_edit
+runtime: mock
+seed: 42
+methods:
+  - initial_skill
+  - current_method
+  - rl_skill_edit
+
+skill_identity:
+  skill_id: main
+  name: main
+  description: API-free RL-Skill-Edit smoke fixture.
+
+paths:
+  initial_skill: data/mock_rl_skill_edit/initial_skill.md
+  train_manifest: data/mock_rl_skill_edit/train.json
+  validation_manifest: data/mock_rl_skill_edit/validation.json
+  test_manifest: data/mock_rl_skill_edit/test.json
+  current_skill: data/mock_rl_skill_edit/current_skill.md
+  current_history: data/mock_rl_skill_edit/current_history.json
+  current_jsonl: data/mock_rl_skill_edit/current_events.jsonl
+  output_dir: results/rl_skill_edit_smoke
+  rl_skill: results/rl_skill_edit_smoke/rl_skill_edit/best_rl_skill.md
+  rl_summary: results/rl_skill_edit_smoke/rl_skill_edit/rl_optimization_summary.json
+  rl_provenance: results/rl_skill_edit_smoke/rl_skill_edit/freeze_provenance.json
+
+split_sizes:
+  train: 2
+  validation: 2
+  test: 2
+
+optimizer:
+  episodes: 2
+  horizon: 2
+  minibatch_size: 2
+  validation_interval: 1
+
+action_space:
+  max_modules: 6
+
+policy:
+  hidden_dim: 16
+  learning_rate: 0.01
+  gamma: 0.95
+  entropy_coef: 0.01
+  value_coef: 0.5
+  max_grad_norm: 1.0
+  normalize_advantages: true
+
+reward:
+  beta_len: 0.0
+  beta_edit: 0.0
+  beta_invalid: 0.2
+
+patch_limits:
+  max_changed_tokens: 80
+  max_length_growth_tokens: 40
+  max_skill_tokens: 500
+
+evaluation:
+  train_repetitions: 1
+  validation_repetitions: 1
+  report_train_repetitions: 1
+  test_repetitions: 2
+  bootstrap_samples: 200
+  use_cache: true
+  paired_tasks: true
+  save_task_level_results: true
+  blind: true
+
+budget:
+  student_rollouts: 30
+  teacher_rollouts: 0
+  reference_rollouts: 0
+  editor_calls: 4
+  evaluator_calls: 13
+  input_tokens: 0
+  output_tokens: 0
+  wall_time_seconds: 30.0

@@ -1,0 +1,14 @@
+{
+  "total_accepted": 2,
+  "cost_summary": {
+    "total_input_tokens": 120,
+    "total_output_tokens": 30,
+    "total_tokens": 150,
+    "total_cost_usd": 0.15,
+    "breakdown_by_type": {
+      "student_rollout": {"calls": 8, "tokens": 100, "cost_usd": 0.08},
+      "teacher_rollout": {"calls": 2, "tokens": 20, "cost_usd": 0.04},
+      "schema_proposal": {"calls": 2, "tokens": 30, "cost_usd": 0.03}
+    }
+  }
+}

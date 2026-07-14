@@ -1,0 +1,101 @@
+method: rl_skill_edit
+runtime: repository
+seed: 42
+methods:
+  - initial_skill
+  # Requires the three archived files under paths.current_* below.
+  - current_method
+  - rl_skill_edit
+
+skill_identity:
+  skill_id: main
+  name: main
+  description: "\uFEFF# Spreadsheet Manipulation Skill (Haiku-optimized)"
+
+paths:
+  repository_config: config.yaml
+  initial_skill: data/spreadsheet/SKILL.md
+  train_manifest: data/spreadsheetbench/splits/dev_pool.json
+  validation_manifest: data/spreadsheetbench/splits/witness.json
+  test_manifest: data/spreadsheetbench/splits/test.json
+  # Optional external archive used only when current_method is requested.
+  current_skill: ../result/spreadsheet/SKILL.md
+  current_history: ../result/spreadsheet/study1_history_20260714_012206.json
+  current_jsonl: ../result/spreadsheet/study1_20260714_012206.jsonl
+  output_dir: results/rl_skill_edit
+  rl_skill: results/rl_skill_edit/rl_skill_edit/best_rl_skill.md
+  rl_summary: results/rl_skill_edit/rl_skill_edit/rl_optimization_summary.json
+  rl_provenance: results/rl_skill_edit/rl_skill_edit/freeze_provenance.json
+
+split_sizes:
+  train: 60
+  validation: 20
+  test: 20
+
+optimizer:
+  episodes: 12
+  horizon: 2
+  minibatch_size: 26
+  validation_interval: 1
+
+action_space:
+  max_modules: 16
+
+policy:
+  hidden_dim: 128
+  learning_rate: 0.001
+  gamma: 0.95
+  entropy_coef: 0.01
+  value_coef: 0.5
+  max_grad_norm: 1.0
+  normalize_advantages: true
+
+reward:
+  beta_len: 0.001
+  beta_edit: 0.001
+  beta_invalid: 0.2
+
+patch_limits:
+  max_changed_tokens: 400
+  max_length_growth_tokens: 200
+  max_skill_tokens: 10000
+
+evaluation:
+  metric: mixed
+  mixed_weight: 0.5
+  success_threshold: 0.8
+  train_repetitions: 1
+  validation_repetitions: 3
+  report_train_repetitions: 1
+  test_repetitions: 3
+  bootstrap_samples: 5000
+  use_cache: true
+  paired_tasks: true
+  save_task_level_results: true
+  blind: true
+  parallel: true
+  workers: 4
+
+models:
+  student:
+    model: anthropic/claude-3-haiku
+    temperature: 0.0
+    max_tokens: 4096
+    max_steps: 3
+  editor:
+    model: anthropic/claude-opus-4.5
+    temperature: 0.0
+    max_tokens: 4096
+
+# Matches the observed 2026-07-14 optimization scope closely:
+# current method used 2,760 optimization rollouts plus 60 archived Final
+# rollouts, 25 Editor calls, and 12 rounds. RL can reach 2,748 rollouts.
+budget:
+  student_rollouts: 2760
+  teacher_rollouts: 0
+  reference_rollouts: 0
+  editor_calls: 25
+  evaluator_calls: 73
+  input_tokens: 55000000
+  output_tokens: 12000000
+  wall_time_seconds: 60000.0
