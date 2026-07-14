@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
-
-from src.evaluator import select_gate_score
 
 from .cache import JsonFileCache
 from .types import EvaluationBatch, SkillArtifact, Split, TaskResult
@@ -18,11 +17,11 @@ def _split(value: Split | str) -> Split:
 
 
 def _task_id(task: Any) -> str:
-    if isinstance(task, dict):
+    if isinstance(task, Mapping):
         value = task.get("task_id")
     else:
         value = getattr(task, "task_id", None)
-    if not isinstance(value, str) or not value:
+    if not isinstance(value, str) or not value.strip():
         raise ValueError("every evaluation task must have a non-empty task_id")
     return value
 
@@ -68,7 +67,7 @@ def _file_identity(value: Any) -> dict[str, Any]:
 
 
 def _task_cache_identity(task: Any) -> dict[str, Any]:
-    if not isinstance(task, dict):
+    if not isinstance(task, Mapping):
         return {"task_id": _task_id(task), "type": type(task).__qualname__}
     if task.get("_entity_fingerprint") and task.get("_content_fingerprint"):
         return {
@@ -76,7 +75,9 @@ def _task_cache_identity(task: Any) -> dict[str, Any]:
             "entity_fingerprint": str(task["_entity_fingerprint"]),
             "content_fingerprint": str(task["_content_fingerprint"]),
         }
-    normalized = json.loads(json.dumps(task, ensure_ascii=False, sort_keys=True))
+    normalized = json.loads(
+        json.dumps(dict(task), ensure_ascii=False, sort_keys=True)
+    )
     spreadsheet = normalized.get("spreadsheet")
     if isinstance(spreadsheet, dict):
         for key in ("init_file", "golden_file"):
@@ -251,12 +252,26 @@ class MockSkillEvaluator:
         return batch
 
 
-class RepositorySkillEvaluator:
-    """Adapter from the repository's frozen Student/Evaluator to RL task batches."""
+def select_score(
+    hard: float,
+    soft: float,
+    metric: str,
+    mixed_weight: float,
+) -> float:
+    if metric == "hard":
+        return float(hard)
+    if metric == "soft":
+        return float(soft)
+    if metric == "mixed":
+        weight = min(1.0, max(0.0, float(mixed_weight)))
+        return (1.0 - weight) * float(hard) + weight * float(soft)
+    raise ValueError(f"unknown metric: {metric}")
 
+
+class SpreadsheetSkillEvaluator:
     def __init__(
         self,
-        evaluator,
+        student: Any,
         *,
         cache: JsonFileCache | None,
         gate_metric: str,
@@ -265,24 +280,24 @@ class RepositorySkillEvaluator:
     ) -> None:
         if gate_metric not in {"hard", "soft", "mixed"}:
             raise ValueError("gate_metric must be hard, soft, or mixed")
-        self.evaluator = evaluator
+        self.student = student
         self.cache = cache
         self.gate_metric = gate_metric
         self.gate_mixed_weight = float(gate_mixed_weight)
         self.success_threshold = float(success_threshold)
-        agent = evaluator.agent
         self.cache_signature = {
-            "adapter": "RepositorySkillEvaluator-v2",
-            "student_model": str(getattr(agent, "model", "")),
-            "student_temperature": float(getattr(agent, "temp", 0.0)),
-            "student_max_tokens": int(getattr(agent, "max_tok", 0)),
-            "student_max_steps": int(getattr(agent, "max_steps", 0)),
-            "activation_mode": "harness",
+            "adapter": "SpreadsheetSkillEvaluator-v1",
+            "student_model": str(getattr(student, "model", "")),
+            "student_temperature": float(getattr(student, "temperature", 0.0)),
+            "student_max_tokens": int(getattr(student, "max_tokens", 0)),
+            "student_max_steps": int(getattr(student, "max_steps", 0)),
+            "activation_mode": "forced-skill-only",
             "gate_metric": self.gate_metric,
             "gate_mixed_weight": self.gate_mixed_weight,
             "success_threshold": self.success_threshold,
-            "blind_protocol": "hide-answer-metadata-and-verifier-retries-v1",
+            "blind_protocol": "single-call-hide-answer-metadata-v1",
         }
+        json.dumps(self.cache_signature, sort_keys=True, allow_nan=False)
         self._frozen = False
 
     def freeze(self) -> None:
@@ -291,15 +306,17 @@ class RepositorySkillEvaluator:
     def cache_will_hit(
         self,
         skill: SkillArtifact,
-        tasks: Iterable[Any],
+        tasks: Iterable[Mapping[str, Any]],
         split: Split | str,
         seed: int,
         repetitions: int,
         blind: bool,
     ) -> bool:
+        split = _split(split)
+        if split is Split.TEST and not self._frozen:
+            raise RuntimeError("formal test evaluation requires freeze")
         if self.cache is None:
             return False
-        split = _split(split)
         tasks = tuple(tasks)
         key = _cache_key(
             skill,
@@ -308,7 +325,7 @@ class RepositorySkillEvaluator:
             seed,
             repetitions,
             blind,
-            "rl-skill-edit-repo-v2",
+            "rl-skill-edit-spreadsheet-v1",
             self.cache_signature,
         )
         return self.cache.get("rollout", key) is not None
@@ -316,7 +333,7 @@ class RepositorySkillEvaluator:
     def evaluate(
         self,
         skill: SkillArtifact,
-        tasks: Iterable[dict[str, Any]],
+        tasks: Iterable[Mapping[str, Any]],
         split: Split | str,
         seed: int,
         repetitions: int,
@@ -324,9 +341,9 @@ class RepositorySkillEvaluator:
         blind: bool,
     ) -> EvaluationBatch:
         split = _split(split)
-        tasks = tuple(tasks)
         if split is Split.TEST and not self._frozen:
             raise RuntimeError("formal test evaluation requires freeze")
+        tasks = tuple(tasks)
         if repetitions < 1:
             raise ValueError("repetitions must be positive")
         if not tasks:
@@ -339,110 +356,117 @@ class RepositorySkillEvaluator:
             seed,
             repetitions,
             blind,
-            "rl-skill-edit-repo-v2",
+            "rl-skill-edit-spreadsheet-v1",
             self.cache_signature,
         )
         if use_cache and self.cache is not None:
             cached = self.cache.get("rollout", key)
             if cached is not None:
-                return _batch_from_dict(cached, cache_hit=True)
+                try:
+                    cached_batch = _batch_from_dict(cached, cache_hit=True)
+                except (KeyError, OverflowError, TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        f"incomplete cached evaluation bundle: {exc}"
+                    ) from exc
+                cache_error = _cached_bundle_error(
+                    cached_batch,
+                    split=split,
+                    tasks=tasks,
+                    repetitions=repetitions,
+                    success_threshold=self.success_threshold,
+                )
+                if cache_error:
+                    raise RuntimeError(
+                        f"incomplete cached evaluation bundle: {cache_error}"
+                    )
+                return cached_batch
 
-        library = skill.to_library()
-        agent = self.evaluator.agent
-        client = getattr(agent, "client", None)
-        input_before = int(getattr(client, "total_input_tokens", 0))
-        output_before = int(getattr(client, "total_output_tokens", 0))
-        cost_before = float(getattr(client, "total_cost_usd", 0.0))
-        started = time.monotonic()
-        if hasattr(agent, "clear_cache"):
-            agent.clear_cache()
-        estimate = self.evaluator.witness_estimate(
-            library,
-            list(tasks),
-            B_W=repetitions,
-            desc=f"RL-Skill-Edit {split.value}",
-            activation_mode="harness",
-            forced_skill_id=skill.skill_id,
-            return_trajectories=True,
-            require_complete=True,
-            verifier_feedback=not blind,
-            expose_answer_metadata=not blind,
-            seed=int(seed),
+        client = getattr(self.student, "client", None)
+        has_client_usage = client is not None and all(
+            hasattr(client, field)
+            for field in (
+                "total_input_tokens",
+                "total_output_tokens",
+                "total_cost_usd",
+            )
         )
-        elapsed = time.monotonic() - started
-        input_tokens = int(getattr(client, "total_input_tokens", 0)) - input_before
-        output_tokens = int(getattr(client, "total_output_tokens", 0)) - output_before
-        cost_usd = float(getattr(client, "total_cost_usd", 0.0)) - cost_before
-        hard_means = estimate["per_task_means"]
-        soft_means = estimate["per_task_soft_means"]
-        hard_raw = estimate["per_task_rewards"]
-        soft_raw = estimate["per_task_soft_rewards"]
-        trajectories = estimate["per_task_trajectories"]
-        if not (
-            len(tasks)
-            == len(hard_means)
-            == len(soft_means)
-            == len(hard_raw)
-            == len(soft_raw)
-            == len(trajectories)
-        ):
-            raise RuntimeError("repository evaluator returned an unaligned task bundle")
-
+        input_before = (
+            int(client.total_input_tokens) if has_client_usage else 0
+        )
+        output_before = (
+            int(client.total_output_tokens) if has_client_usage else 0
+        )
+        cost_before = float(client.total_cost_usd) if has_client_usage else 0.0
+        started = time.monotonic()
         results: list[TaskResult] = []
         total_tokens = 0
-        total_cost = 0.0
-        for index, task in enumerate(tasks):
+        total_cost_usd = 0.0
+        for task_index, task in enumerate(tasks):
+            expected_task_id = _task_id(task)
+            trajectory_list = []
+            for repetition in range(repetitions):
+                trajectory = self.student.run_task(
+                    task,
+                    skill,
+                    blind=blind,
+                    seed=int(seed) + task_index * repetitions + repetition,
+                )
+                error = _trajectory_bundle_error(trajectory, expected_task_id)
+                if error:
+                    raise RuntimeError(
+                        "incomplete evaluation bundle: "
+                        f"task={expected_task_id} repetition={repetition}: {error}"
+                    )
+                trajectory_list.append(trajectory)
+            trajectories = tuple(trajectory_list)
             raw_rewards = tuple(
-                select_gate_score(hard, soft, self.gate_metric, self.gate_mixed_weight)
-                for hard, soft in zip(hard_raw[index], soft_raw[index], strict=True)
+                select_score(
+                    trajectory.hard_reward,
+                    trajectory.soft_reward,
+                    self.gate_metric,
+                    self.gate_mixed_weight,
+                )
+                for trajectory in trajectories
             )
-            reward = select_gate_score(
-                hard_means[index],
-                soft_means[index],
-                self.gate_metric,
-                self.gate_mixed_weight,
+            reward = sum(raw_rewards) / len(raw_rewards)
+            representative = trajectories[-1]
+            total_tokens += sum(
+                int(trajectory.total_tokens) for trajectory in trajectories
             )
-            task_trajectories = tuple(trajectories[index])
-            for trajectory in task_trajectories:
-                total_tokens += int(getattr(trajectory, "total_tokens", 0))
-                total_cost += float(getattr(trajectory, "total_cost_usd", 0.0))
-
-            feedback = ""
-            evaluator_output = ""
-            final_answer = ""
-            visible_logs: tuple[str, ...] = ()
-            if not blind and task_trajectories:
-                trajectory = task_trajectories[-1]
-                final_answer = (
-                    str(trajectory.steps[-1].action) if trajectory.steps else ""
-                )
-                signals = tuple(
-                    json.dumps(signal, ensure_ascii=False, sort_keys=True)
-                    for signal in getattr(trajectory, "step_execution_signals", ())
-                )
-                visible_logs = signals
-                detail = dict(getattr(trajectory, "score_detail", {}) or {})
-                detail.pop("answer_pos", None)
-                detail.pop("answer_sheet", None)
-                evaluator_output = json.dumps(
-                    detail, ensure_ascii=False, sort_keys=True
-                )
-                feedback = (
-                    f"reward={reward:.6f}; success={reward >= self.success_threshold}"
-                )
+            total_cost_usd += sum(
+                float(trajectory.total_cost_usd) for trajectory in trajectories
+            )
             results.append(
                 TaskResult(
                     task_id=_task_id(task),
-                    reward=float(reward),
-                    success=bool(reward >= self.success_threshold),
-                    feedback=feedback,
-                    evaluator_output=evaluator_output,
-                    final_answer=final_answer,
-                    visible_logs=visible_logs,
+                    reward=reward,
+                    success=reward >= self.success_threshold,
+                    feedback=(
+                        ""
+                        if blind
+                        else f"reward={reward:.6f}; "
+                        f"success={reward >= self.success_threshold}"
+                    ),
+                    final_answer="" if blind else representative.final_answer,
+                    visible_logs=() if blind else representative.visible_logs,
                     raw_rewards=raw_rewards,
                 )
             )
-
+        if has_client_usage:
+            input_tokens = int(client.total_input_tokens) - input_before
+            output_tokens = int(client.total_output_tokens) - output_before
+            client_cost_usd = float(client.total_cost_usd) - cost_before
+            if (
+                input_tokens < 0
+                or output_tokens < 0
+                or not math.isfinite(client_cost_usd)
+                or client_cost_usd < 0.0
+            ):
+                raise RuntimeError("incomplete evaluation bundle: invalid client usage")
+        else:
+            input_tokens = 0
+            output_tokens = 0
+            client_cost_usd = total_cost_usd
         batch = EvaluationBatch(
             split=split,
             results=tuple(results),
@@ -451,10 +475,14 @@ class RepositorySkillEvaluator:
                 "student_rollouts": len(tasks) * repetitions,
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
-                "total_tokens": input_tokens + output_tokens,
+                "total_tokens": (
+                    input_tokens + output_tokens
+                    if has_client_usage
+                    else total_tokens
+                ),
                 "trajectory_total_tokens": total_tokens,
-                "cost_usd": cost_usd if client is not None else total_cost,
-                "elapsed_s": elapsed,
+                "cost_usd": client_cost_usd,
+                "elapsed_s": time.monotonic() - started,
             },
         )
         if use_cache and self.cache is not None:
@@ -462,4 +490,78 @@ class RepositorySkillEvaluator:
         return batch
 
 
-__all__ = ["MockSkillEvaluator", "RepositorySkillEvaluator"]
+def _trajectory_bundle_error(trajectory: Any, expected_task_id: str) -> str:
+    if getattr(trajectory, "task_id", None) != expected_task_id:
+        return "trajectory task_id does not match its task"
+    if getattr(trajectory, "evaluation_valid", None) is not True:
+        reason = str(getattr(trajectory, "invalid_reason", "") or "invalid rollout")
+        return reason
+    for field_name in ("hard_reward", "soft_reward"):
+        value = getattr(trajectory, field_name, None)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+        ):
+            return f"invalid {field_name}"
+    total_tokens = getattr(trajectory, "total_tokens", None)
+    if (
+        isinstance(total_tokens, bool)
+        or not isinstance(total_tokens, int)
+        or total_tokens < 0
+    ):
+        return "invalid total_tokens"
+    total_cost = getattr(trajectory, "total_cost_usd", None)
+    if (
+        isinstance(total_cost, bool)
+        or not isinstance(total_cost, (int, float))
+        or not math.isfinite(float(total_cost))
+        or float(total_cost) < 0.0
+    ):
+        return "invalid total_cost_usd"
+    if not isinstance(getattr(trajectory, "final_answer", None), str):
+        return "invalid final_answer"
+    visible_logs = getattr(trajectory, "visible_logs", None)
+    if not isinstance(visible_logs, tuple) or not all(
+        isinstance(log, str) for log in visible_logs
+    ):
+        return "invalid visible_logs"
+    return ""
+
+
+def _cached_bundle_error(
+    batch: EvaluationBatch,
+    *,
+    split: Split,
+    tasks: tuple[Mapping[str, Any], ...],
+    repetitions: int,
+    success_threshold: float,
+) -> str:
+    if batch.split is not split:
+        return "cached split does not match request"
+    expected_ids = tuple(_task_id(task) for task in tasks)
+    if batch.ordered_task_ids != expected_ids:
+        return "cached task order does not match request"
+    for result in batch.results:
+        if len(result.raw_rewards) != repetitions:
+            return f"cached repetition count is incomplete for {result.task_id}"
+        if not all(math.isfinite(value) for value in result.raw_rewards):
+            return f"cached reward is non-finite for {result.task_id}"
+        expected_reward = sum(result.raw_rewards) / repetitions
+        if not math.isclose(
+            result.reward,
+            expected_reward,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            return f"cached mean reward is inconsistent for {result.task_id}"
+        if result.success is not (result.reward >= success_threshold):
+            return f"cached success flag is inconsistent for {result.task_id}"
+    return ""
+
+
+__all__ = [
+    "MockSkillEvaluator",
+    "SpreadsheetSkillEvaluator",
+    "select_score",
+]

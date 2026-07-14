@@ -77,20 +77,6 @@ class SkillArtifact:
             encoding="utf-8",
         )
 
-    def to_library(self):
-        from src.skill_library import SkillCore, SkillLibrary
-
-        return SkillLibrary(
-            [
-                SkillCore(
-                    skill_id=self.skill_id,
-                    name=self.name,
-                    description=self.description,
-                    execution_body=self.body,
-                )
-            ]
-        )
-
     def with_body(self, body: str) -> "SkillArtifact":
         return SkillArtifact(
             self.skill_id,

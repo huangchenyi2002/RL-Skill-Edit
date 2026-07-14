@@ -28,7 +28,9 @@ def _batch(split: Split, scores: dict[str, float]) -> EvaluationBatch:
     )
 
 
-def test_skill_artifact_round_trip_digest_and_library_adapter(tmp_path: Path):
+def test_skill_artifact_round_trip_digest_without_legacy_library_adapter(
+    tmp_path: Path,
+):
     source = tmp_path / "SKILL.md"
     source.write_text(
         "---\nname: Lookup Skill\ndescription: Safe lookup\n---\n\n# Rules\nUse exact keys.\n",
@@ -53,8 +55,7 @@ def test_skill_artifact_round_trip_digest_and_library_adapter(tmp_path: Path):
             artifact.body + "Changed",
         ).digest
     )
-    library_skill = artifact.to_library().get("spreadsheet__lookup")
-    assert library_skill.execution_body == artifact.body
+    assert not hasattr(SkillArtifact, "to_library")
 
 
 def test_parser_is_stable_non_overlapping_and_distinguishes_duplicate_titles():
