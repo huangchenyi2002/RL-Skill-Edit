@@ -4,7 +4,7 @@ import hashlib
 import json
 import re
 from dataclasses import asdict, is_dataclass
-from typing import Any, Iterable
+from typing import Any, Iterable, Protocol
 
 from .action_space import EditOperator
 from .cache import JsonFileCache
@@ -26,6 +26,10 @@ _PATCH_FIELDS = {
     "new_text",
     "expected_effect",
 }
+
+
+class ChatClient(Protocol):
+    def chat(self, **kwargs: Any) -> tuple[str, dict[str, Any]]: ...
 
 
 def _parse_patch(payload: Any) -> EditPatch:
@@ -84,7 +88,7 @@ class OpenRouterPatchGenerator:
     def __init__(
         self,
         *,
-        client,
+        client: ChatClient,
         cache: JsonFileCache,
         model: str,
         temperature: float,
