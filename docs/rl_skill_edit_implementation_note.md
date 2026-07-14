@@ -1,9 +1,32 @@
 # RL-Skill-Edit implementation note
 
-The existing experiment is orchestrated by `study1_main.py::run_study1()`. It loads one `SKILL.md` through `SkillLibrary`, uses Dev for Student/Expert-endpoint/Reference rollouts and target construction, repeatedly uses Witness for candidate gates and checkpoint selection, and evaluates only the selected skill on Final Holdout. Student execution and spreadsheet scoring live in `src/agent.py`; repeated evaluation lives in `src/evaluator.py`; Editor calls live in `src/teacher.py`; skill persistence lives in `src/skill_library.py`; API usage accounting lives in `src/client.py`.
+The CLI implements one fixed sequence: load a neutral initial Markdown Skill,
+optimize it on Train, select the saved checkpoint on Validation, freeze the Skill
+and provenance, then run a fresh blind Test for the initial and RL-edited Skills.
+The initial Skill is an input and reporting baseline, not an optimizer.
 
-RL-Skill-Edit is implemented as an independent optimizer rather than being inserted into the teacher-reference target loop. It reuses the frozen Student and spreadsheet score through an adapter, but it never instantiates the Teacher, Expert endpoint, Parser, lambda estimator, or teacher-reference projection. A small NumPy actor-critic selects `(Markdown module, edit operator)`; the configured Editor supplies one structured local patch; the transition reward is the paired Train-task score difference minus length, edit-distance, and invalid-action penalties. Validation selects the saved Skill checkpoint.
+The frozen Student receives exactly one active Skill. A NumPy actor-critic masks
+invalid actions and samples a Markdown module plus edit operator. The frozen
+Editor returns one structured local patch; strict validation rejects ambiguous,
+out-of-scope, oversized, or malformed edits. Paired Train score change, length,
+edit-distance, and invalid-action costs form the transition reward. Validation
+never updates the policy.
 
-The runner initially opens only the Train and Validation manifests. After `initial_skill`, imported `current_method`, RL, and optional random search have all produced frozen Skill artifacts, it loads and cross-checks the Test manifest. Every method then receives the same blind Student protocol and ordered Test bundle with cache reads disabled. A test-only rerun is accepted only when the frozen Skill digest, initial digest, full config hash, implementation hash, dependency-lock hash, optimization-summary hash, seed, and all three split digests match `freeze_provenance.json`. The experiment manifest also hashes the imported current Skill/history/JSONL and checks history/JSONL run IDs when the legacy archive supplies them; the old archive has no final-Skill digest, so their historical binding remains explicitly unavailable.
+The Spreadsheet adapter copies each input workbook, extracts one explicit Python
+code block, executes it in a restricted subprocess, and compares the declared
+golden range with strict cell-type and workbook-structure checks. Empty or invalid
+model output, incomplete API usage, execution failure, and unsupported workbook
+values fail explicitly. The subprocess controls reduce accidental damage but do
+not replace VM or container isolation for generated code.
 
-Resource reporting separates optimization usage from the common Train/Validation/Test reporting pass. Cached evidence still consumes the logical rollout/call budget and is split into cached versus newly executed work; only new calls add tokens, cost, and model time. The archived current-method JSONL can recover phase-specific rollout counts and optimization wall time, but its historical token/cost summary includes the old Final pass because that archive did not record phase-level token/cost counters; this scope is written explicitly in the comparison row. Real runs also require the three workbook manifests, which are not present in this checkout, and reproducibility assumes the selected API provider honors the supplied seed.
+Freeze provenance binds the initial and selected Skill digests, normalized
+configuration, ordered split digests, implementation files, `requirements.txt`,
+optimization summary, skill identity, and seed. `--test-only` rejects missing,
+unknown, or changed fields. The Test pass uses identical task order, seeds, and
+repetitions for both Skills, keeps prompts blind, and disables cache reads.
+
+All optimization artifacts, five paired reports, the experiment manifest, cache,
+and hidden ownership marker are built in staging. Publication validates the full
+tree and installs it transactionally. An existing verified tree is retained at a
+deterministic `.previous` path, and any failed replacement restores it without
+touching private input files.

@@ -28,10 +28,10 @@ skill_identity:
   description: Spreadsheet manipulation skill optimized by RL-Skill-Edit.
 
 paths:
-  initial_skill: data/spreadsheet/SKILL.md
-  train_manifest: data/spreadsheetbench/splits/dev_pool.json
-  validation_manifest: data/spreadsheetbench/splits/witness.json
-  test_manifest: data/spreadsheetbench/splits/test.json
+  initial_skill: data/initial_skill.md
+  train_manifest: data/private/train.json
+  validation_manifest: data/private/validation.json
+  test_manifest: data/private/test.json
   output_dir: results/rl_skill_edit
   rl_skill: results/rl_skill_edit/rl_skill_edit/best_rl_skill.md
   rl_summary: results/rl_skill_edit/rl_skill_edit/rl_optimization_summary.json

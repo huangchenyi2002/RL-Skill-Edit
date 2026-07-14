@@ -8,4 +8,5 @@ __pycache__/
 .env.*
 logs/
 results/
+data/private/
 tmp/

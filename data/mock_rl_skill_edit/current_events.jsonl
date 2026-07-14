@@ -1,5 +1,0 @@
-{"event":"usage","role":"student","rollouts":8}
-{"event":"usage","role":"teacher","rollouts":2}
-{"event":"usage","role":"reference","rollouts":2}
-{"event":"usage","role":"editor","calls":2}
-{"event":"session_end","t_elapsed":12.5}
