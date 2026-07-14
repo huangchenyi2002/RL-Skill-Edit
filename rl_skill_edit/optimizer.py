@@ -589,7 +589,6 @@ class RLSkillEditOptimizer:
                 cache_probe(skill, tasks, split, seed, repetitions, blind)
             )
         reservation = budget.reserve_evaluation(
-            role="student",
             task_count=len(tasks),
             repetitions=repetitions,
             cache_hit=rollout_cache_hit,
@@ -611,8 +610,6 @@ class RLSkillEditOptimizer:
         self._record_evaluation(
             budget,
             reservation,
-            task_count=len(tasks),
-            repetitions=repetitions,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             elapsed_seconds=(
@@ -626,28 +623,16 @@ class RLSkillEditOptimizer:
         budget: Any,
         reservation: Any,
         *,
-        task_count: int,
-        repetitions: int,
         input_tokens: int,
         output_tokens: int,
         elapsed_seconds: float,
     ) -> None:
-        if reservation is None:
-            budget.record_evaluation(
-                role="student",
-                task_count=task_count,
-                repetitions=repetitions,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                elapsed_seconds=elapsed_seconds,
-            )
-        else:
-            budget.record_evaluation(
-                reservation,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                elapsed_seconds=elapsed_seconds,
-            )
+        budget.record_evaluation(
+            reservation,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            elapsed_seconds=elapsed_seconds,
+        )
 
     def _record_editor(
         self,
@@ -664,10 +649,7 @@ class RLSkillEditOptimizer:
             "output_tokens": int(usage.get("output_tokens", 0)),
             "elapsed_seconds": float(usage.get("elapsed_s", editor_elapsed)),
         }
-        if reservation is None:
-            budget.record_editor(**kwargs)
-        else:
-            budget.record_editor(reservation, **kwargs)
+        budget.record_editor(reservation, **kwargs)
 
     @staticmethod
     def _append_log(path: Path, payload: dict[str, Any]) -> None:

@@ -12,8 +12,6 @@ from rl_skill_edit.cache import JsonFileCache
 
 LIMITS = {
     "student_rollouts": 6,
-    "teacher_rollouts": 2,
-    "reference_rollouts": 3,
     "editor_calls": 2,
     "evaluator_calls": 4,
     "input_tokens": 100,
@@ -22,41 +20,62 @@ LIMITS = {
 }
 
 
+def test_budget_accepts_only_rl_resources():
+    ledger = BudgetLedger(
+        {
+            "student_rollouts": 4,
+            "editor_calls": 1,
+            "evaluator_calls": 2,
+            "input_tokens": 100,
+            "output_tokens": 100,
+            "wall_time_seconds": 10.0,
+        }
+    )
+
+    snapshot = ledger.snapshot().to_dict()
+
+    assert set(snapshot) == {
+        "student_rollouts",
+        "editor_calls",
+        "evaluator_calls",
+        "input_tokens",
+        "output_tokens",
+        "wall_time_seconds",
+        "cache_hits",
+        "cached_student_rollouts",
+        "cached_editor_calls",
+        "cached_evaluator_calls",
+    }
+
+
+def test_budget_rejects_non_rl_limits():
+    with pytest.raises(ValueError, match="unknown budget limits"):
+        BudgetLedger(
+            {
+                **LIMITS,
+                "teacher_rollouts": 0,
+                "reference_rollouts": 0,
+            }
+        )
+
+
 def test_evaluation_bundle_reservation_fails_atomically_before_partial_work():
     ledger = BudgetLedger(LIMITS)
     before = ledger.snapshot()
 
     with pytest.raises(BudgetExceeded):
-        ledger.reserve_evaluation(
-            role="student", task_count=4, repetitions=2, cache_hit=False
-        )
+        ledger.reserve_evaluation(task_count=4, repetitions=2, cache_hit=False)
 
     assert ledger.snapshot() == before
 
 
 def test_budget_counts_logical_work_and_marks_cache_reuse_separately():
     ledger = BudgetLedger(LIMITS)
-    student = ledger.reserve_evaluation(
-        "student", task_count=2, repetitions=2, cache_hit=False
-    )
+    evaluated = ledger.reserve_evaluation(task_count=2, repetitions=2, cache_hit=False)
     ledger.record_evaluation(
-        student, input_tokens=20, output_tokens=8, elapsed_seconds=1.5
+        evaluated, input_tokens=20, output_tokens=8, elapsed_seconds=1.5
     )
-    teacher = ledger.reserve_evaluation(
-        "teacher", task_count=1, repetitions=1, cache_hit=False
-    )
-    ledger.record_evaluation(
-        teacher, input_tokens=10, output_tokens=4, elapsed_seconds=0.5
-    )
-    reference = ledger.reserve_evaluation(
-        "reference", task_count=3, repetitions=1, cache_hit=False
-    )
-    ledger.record_evaluation(
-        reference, input_tokens=12, output_tokens=5, elapsed_seconds=0.7
-    )
-    cached = ledger.reserve_evaluation(
-        "student", task_count=1, repetitions=1, cache_hit=True
-    )
+    cached = ledger.reserve_evaluation(task_count=1, repetitions=1, cache_hit=True)
     ledger.record_evaluation(
         cached, input_tokens=0, output_tokens=0, elapsed_seconds=0.0
     )
@@ -69,13 +88,11 @@ def test_budget_counts_logical_work_and_marks_cache_reuse_separately():
 
     snapshot = ledger.snapshot()
     assert snapshot.student_rollouts == 5
-    assert snapshot.teacher_rollouts == 1
-    assert snapshot.reference_rollouts == 3
     assert snapshot.editor_calls == 2
-    assert snapshot.evaluator_calls == 4
-    assert snapshot.input_tokens == 51
-    assert snapshot.output_tokens == 24
-    assert snapshot.wall_time_seconds == pytest.approx(3.0)
+    assert snapshot.evaluator_calls == 2
+    assert snapshot.input_tokens == 29
+    assert snapshot.output_tokens == 15
+    assert snapshot.wall_time_seconds == pytest.approx(1.8)
     assert snapshot.cache_hits == 2
     assert snapshot.cached_student_rollouts == 1
     assert snapshot.cached_editor_calls == 1

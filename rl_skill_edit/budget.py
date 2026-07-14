@@ -9,14 +9,11 @@ from typing import Any, Mapping
 
 _STRUCTURAL_LIMITS = (
     "student_rollouts",
-    "teacher_rollouts",
-    "reference_rollouts",
     "editor_calls",
     "evaluator_calls",
 )
 _USAGE_LIMITS = ("input_tokens", "output_tokens", "wall_time_seconds")
 _REQUIRED_LIMITS = _STRUCTURAL_LIMITS + _USAGE_LIMITS
-_ROLES = frozenset(("student", "teacher", "reference"))
 
 
 class BudgetExceeded(RuntimeError):
@@ -26,8 +23,6 @@ class BudgetExceeded(RuntimeError):
 @dataclass(frozen=True)
 class BudgetSnapshot:
     student_rollouts: int = 0
-    teacher_rollouts: int = 0
-    reference_rollouts: int = 0
     editor_calls: int = 0
     evaluator_calls: int = 0
     input_tokens: int = 0
@@ -35,8 +30,6 @@ class BudgetSnapshot:
     wall_time_seconds: float = 0.0
     cache_hits: int = 0
     cached_student_rollouts: int = 0
-    cached_teacher_rollouts: int = 0
-    cached_reference_rollouts: int = 0
     cached_editor_calls: int = 0
     cached_evaluator_calls: int = 0
 
@@ -50,7 +43,6 @@ class BudgetReservation:
     ledger_id: str
     kind: str
     cache_hit: bool
-    role: str | None = None
     task_count: int = 0
     repetitions: int = 0
 
@@ -82,8 +74,6 @@ class BudgetLedger:
         self._counts["cache_hits"] = 0
         for name in (
             "cached_student_rollouts",
-            "cached_teacher_rollouts",
-            "cached_reference_rollouts",
             "cached_editor_calls",
             "cached_evaluator_calls",
         ):
@@ -95,13 +85,11 @@ class BudgetLedger:
 
     def reserve_evaluation(
         self,
-        role: str,
         *,
         task_count: int,
         repetitions: int = 1,
         cache_hit: bool = False,
     ) -> BudgetReservation:
-        normalized_role = _role(role)
         tasks = _positive_integer("task_count", task_count)
         repeats = _positive_integer("repetitions", repetitions)
         cached = _boolean("cache_hit", cache_hit)
@@ -110,20 +98,19 @@ class BudgetLedger:
             ledger_id=self._ledger_id,
             kind="evaluation",
             cache_hit=cached,
-            role=normalized_role,
             task_count=tasks,
             repetitions=repeats,
         )
         with self._lock:
             deltas = {
-                f"{normalized_role}_rollouts": tasks * repeats,
+                "student_rollouts": tasks * repeats,
                 "evaluator_calls": 1,
             }
             self._check_deltas(deltas)
             self._apply_deltas(deltas)
             if cached:
                 self._counts["cache_hits"] += 1
-                self._counts[f"cached_{normalized_role}_rollouts"] += tasks * repeats
+                self._counts["cached_student_rollouts"] += tasks * repeats
                 self._counts["cached_evaluator_calls"] += 1
             self._reservations[reservation.reservation_id] = reservation
         return reservation
@@ -181,8 +168,6 @@ class BudgetLedger:
         with self._lock:
             return BudgetSnapshot(
                 student_rollouts=int(self._counts["student_rollouts"]),
-                teacher_rollouts=int(self._counts["teacher_rollouts"]),
-                reference_rollouts=int(self._counts["reference_rollouts"]),
                 editor_calls=int(self._counts["editor_calls"]),
                 evaluator_calls=int(self._counts["evaluator_calls"]),
                 input_tokens=int(self._counts["input_tokens"]),
@@ -190,10 +175,6 @@ class BudgetLedger:
                 wall_time_seconds=float(self._counts["wall_time_seconds"]),
                 cache_hits=int(self._counts["cache_hits"]),
                 cached_student_rollouts=int(self._counts["cached_student_rollouts"]),
-                cached_teacher_rollouts=int(self._counts["cached_teacher_rollouts"]),
-                cached_reference_rollouts=int(
-                    self._counts["cached_reference_rollouts"]
-                ),
                 cached_editor_calls=int(self._counts["cached_editor_calls"]),
                 cached_evaluator_calls=int(self._counts["cached_evaluator_calls"]),
             )
@@ -274,15 +255,6 @@ class BudgetLedger:
     def _apply_deltas(self, deltas: Mapping[str, int | Decimal]) -> None:
         for name, delta in deltas.items():
             self._counts[name] += delta
-
-
-def _role(value: Any) -> str:
-    if not isinstance(value, str):
-        raise TypeError("role must be a string")
-    normalized = value.strip().lower()
-    if normalized not in _ROLES:
-        raise ValueError(f"unknown evaluation role: {value!r}")
-    return normalized
 
 
 def _boolean(name: str, value: Any) -> bool:

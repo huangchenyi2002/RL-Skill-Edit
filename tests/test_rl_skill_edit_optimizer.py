@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 
 from rl_skill_edit.action_space import EditOperator
+from rl_skill_edit.budget import BudgetLedger
 from rl_skill_edit.cache import JsonFileCache
 from rl_skill_edit.evaluation import MockSkillEvaluator
 from rl_skill_edit.optimizer import RLSkillEditOptimizer
@@ -170,52 +171,18 @@ class InvalidStructuredPatchGenerator:
         )
 
 
-class RecordingBudget:
+class RecordingBudget(BudgetLedger):
     def __init__(self) -> None:
-        self.roles: list[str] = []
-        self.counters = {
-            "student_rollouts": 0,
-            "teacher_rollouts": 0,
-            "reference_rollouts": 0,
-            "editor_calls": 0,
-            "evaluator_calls": 0,
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "elapsed_s": 0.0,
-        }
-
-    def reserve_evaluation(self, *args, **kwargs) -> None:
-        role = str(
-            kwargs.get(
-                "role", args[0] if args and isinstance(args[0], str) else "student"
-            )
-        ).lower()
-        self.roles.append(role)
-
-    def record_evaluation(self, *args, **kwargs) -> None:
-        role = str(
-            kwargs.get(
-                "role", args[0] if args and isinstance(args[0], str) else "student"
-            )
-        ).lower()
-        task_count = int(kwargs.get("task_count", kwargs.get("rollouts", 0)))
-        repetitions = int(kwargs.get("repetitions", 1))
-        key = f"{role}_rollouts"
-        if key in self.counters:
-            self.counters[key] += task_count * repetitions
-        self.counters["evaluator_calls"] += 1
-
-    def reserve_editor(self, *args, **kwargs) -> None:
-        self.roles.append("editor")
-
-    def record_editor(self, *args, **kwargs) -> None:
-        self.counters["editor_calls"] += 1
-
-    def remaining_fraction(self) -> float:
-        return 1.0
-
-    def snapshot(self) -> dict:
-        return dict(self.counters)
+        super().__init__(
+            {
+                "student_rollouts": 1_000,
+                "editor_calls": 1_000,
+                "evaluator_calls": 1_000,
+                "input_tokens": 1_000,
+                "output_tokens": 1_000,
+                "wall_time_seconds": 1_000.0,
+            }
+        )
 
 
 def _skill() -> SkillArtifact:
@@ -409,7 +376,7 @@ def test_malformed_editor_output_is_an_invalid_transition_not_a_crash(tmp_path):
     assert "strict JSON" in log["patch_reason"]
     assert log["reward_components"]["invalid_cost"] == 1
     assert result.final_skill.digest == _skill().digest
-    assert budget.snapshot()["editor_calls"] == 1
+    assert budget.snapshot().editor_calls == 1
 
 
 def test_stop_ends_episode_without_editor_or_candidate_train_call(tmp_path):
@@ -465,14 +432,22 @@ def test_validation_selects_best_checkpoint_not_last_episode_state(tmp_path):
     assert "RULE_2" not in result.best_skill.body
 
 
-def test_pure_rl_never_reserves_teacher_or_reference_work(tmp_path):
+def test_optimizer_budget_snapshot_has_only_rl_counters(tmp_path):
     budget = RecordingBudget()
     _run_optimizer(tmp_path, actions=[REWRITE_RULE_INDEX], budget=budget)
 
-    assert "teacher" not in budget.roles
-    assert "reference" not in budget.roles
-    assert budget.snapshot()["teacher_rollouts"] == 0
-    assert budget.snapshot()["reference_rollouts"] == 0
+    assert set(budget.snapshot().to_dict()) == {
+        "student_rollouts",
+        "editor_calls",
+        "evaluator_calls",
+        "input_tokens",
+        "output_tokens",
+        "wall_time_seconds",
+        "cache_hits",
+        "cached_student_rollouts",
+        "cached_editor_calls",
+        "cached_evaluator_calls",
+    }
 
 
 def test_optimizer_writes_required_auditable_artifacts_and_step_fields(tmp_path):
