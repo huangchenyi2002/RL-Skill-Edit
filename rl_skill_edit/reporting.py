@@ -3,53 +3,56 @@ from __future__ import annotations
 import csv
 import json
 import math
+import os
 import re
+import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 import numpy as np
 
-from .types import EvaluationBatch, SkillArtifact, Split
+from .types import EvaluationBatch, SkillArtifact, Split, TaskResult
 
 
 _METHOD_NAMES = ("initial_skill", "rl_skill_edit")
-_RESOURCE_INTEGER_FIELDS = frozenset(
-    {
-        "student_rollouts",
-        "editor_calls",
-        "evaluator_calls",
-        "input_tokens",
-        "output_tokens",
-        "cache_hits",
-        "cached_student_rollouts",
-        "cached_editor_calls",
-        "cached_evaluator_calls",
-        "total_tokens",
-        "edit_count",
-    }
+_REPORT_FILE_NAMES = (
+    "frozen_method_artifacts.json",
+    "method_comparison.csv",
+    "task_level_scores.csv",
+    "test_task_level_results.csv",
+    "comparison_report.json",
 )
-_RESOURCE_NUMBER_FIELDS = frozenset(
-    {
-        "wall_time_seconds",
-        "cost_usd",
-        "rollout_cost_usd",
-        "editor_cost_usd",
-        "wall_time_s",
-    }
+_RESOURCE_INTEGER_FIELDS = (
+    "student_rollouts",
+    "editor_calls",
+    "evaluator_calls",
+    "input_tokens",
+    "output_tokens",
+    "cache_hits",
+    "cached_student_rollouts",
+    "cached_editor_calls",
+    "cached_evaluator_calls",
+    "total_tokens",
+    "edit_count",
 )
-_REPORTING_INTEGER_FIELDS = frozenset(
-    {
-        "student_rollouts",
-        "evaluator_calls",
-        "cached_student_rollouts",
-        "cached_evaluator_calls",
-        "input_tokens",
-        "output_tokens",
-        "total_tokens",
-    }
+_RESOURCE_NUMBER_FIELDS = (
+    "wall_time_seconds",
+    "cost_usd",
+    "rollout_cost_usd",
+    "editor_cost_usd",
+    "wall_time_s",
 )
-_REPORTING_NUMBER_FIELDS = frozenset({"cost_usd", "elapsed_s"})
+_REPORTING_INTEGER_FIELDS = (
+    "student_rollouts",
+    "evaluator_calls",
+    "cached_student_rollouts",
+    "cached_evaluator_calls",
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+)
+_REPORTING_NUMBER_FIELDS = ("cost_usd", "elapsed_s")
 _BATCH_USAGE_FIELDS = frozenset(
     {
         "student_rollouts",
@@ -61,6 +64,7 @@ _BATCH_USAGE_FIELDS = frozenset(
         "elapsed_s",
     }
 )
+_BATCH_REQUIRED_USAGE_FIELDS = _BATCH_USAGE_FIELDS - {"trajectory_total_tokens"}
 
 
 @dataclass(frozen=True)
@@ -86,7 +90,12 @@ class ResourceUsage:
     def from_mapping(cls, value: Mapping[str, Any]) -> ResourceUsage:
         if not isinstance(value, Mapping):
             raise TypeError("optimization_usage must be a mapping")
-        allowed = _RESOURCE_INTEGER_FIELDS | _RESOURCE_NUMBER_FIELDS
+        if not value:
+            return cls()
+        allowed = set(_RESOURCE_INTEGER_FIELDS) | set(_RESOURCE_NUMBER_FIELDS)
+        missing = allowed - set(value)
+        if missing:
+            raise ValueError(f"optimization_usage is missing fields: {sorted(missing)}")
         unknown = set(value) - allowed
         if unknown:
             raise ValueError(
@@ -94,15 +103,32 @@ class ResourceUsage:
             )
         parsed: dict[str, int | float] = {}
         for name in _RESOURCE_INTEGER_FIELDS:
-            if name in value:
-                parsed[name] = _nonnegative_integer(
-                    f"optimization_usage.{name}", value[name]
-                )
+            parsed[name] = _nonnegative_integer(
+                f"optimization_usage.{name}", value[name]
+            )
         for name in _RESOURCE_NUMBER_FIELDS:
-            if name in value:
-                parsed[name] = _nonnegative_number(
-                    f"optimization_usage.{name}", value[name]
-                )
+            parsed[name] = _nonnegative_number(
+                f"optimization_usage.{name}", value[name]
+            )
+        _validate_usage_totals("optimization_usage", parsed)
+        _validate_cached_count(
+            "optimization_usage",
+            parsed,
+            cached_name="cached_student_rollouts",
+            total_name="student_rollouts",
+        )
+        _validate_cached_count(
+            "optimization_usage",
+            parsed,
+            cached_name="cached_editor_calls",
+            total_name="editor_calls",
+        )
+        _validate_cached_count(
+            "optimization_usage",
+            parsed,
+            cached_name="cached_evaluator_calls",
+            total_name="evaluator_calls",
+        )
         return cls(**parsed)
 
     def to_dict(self) -> dict[str, int | float]:
@@ -148,8 +174,8 @@ def paired_bootstrap_ci(
     sample_count = _positive_integer("samples", samples)
     random_seed = _integer("seed", seed)
     confidence_alpha = _number("alpha", alpha)
-    initial_array = np.asarray(tuple(initial), dtype=float)
-    candidate_array = np.asarray(tuple(candidate), dtype=float)
+    initial_array = _reward_array("initial rewards", initial)
+    candidate_array = _reward_array("candidate rewards", candidate)
     if initial_array.shape != candidate_array.shape or initial_array.ndim != 1:
         raise ValueError(
             "paired bootstrap inputs must be aligned one-dimensional arrays"
@@ -178,8 +204,8 @@ def paired_statistics(
     tie_tolerance: float = 1e-12,
 ) -> PairedStats:
     tolerance = _nonnegative_number("tie_tolerance", tie_tolerance)
-    initial_array = np.asarray(tuple(initial), dtype=float)
-    candidate_array = np.asarray(tuple(candidate), dtype=float)
+    initial_array = _reward_array("initial rewards", initial)
+    candidate_array = _reward_array("candidate rewards", candidate)
     success_values = tuple(successes)
     if any(type(value) is not bool for value in success_values):
         raise TypeError("successes must contain only booleans")
@@ -198,7 +224,10 @@ def paired_statistics(
         else 0.0
     )
     ci_low, ci_high = paired_bootstrap_ci(
-        initial_array, candidate_array, samples=samples, seed=seed
+        tuple(float(value) for value in initial_array),
+        tuple(float(value) for value in candidate_array),
+        samples=samples,
+        seed=seed,
     )
     wins = int(np.sum(differences > tolerance))
     losses = int(np.sum(differences < -tolerance))
@@ -244,15 +273,25 @@ def run_frozen_report(
     sample_count = _positive_integer("bootstrap_samples", bootstrap_samples)
     if not isinstance(reporting_usage, Mapping):
         raise TypeError("reporting_usage must be a mapping")
-    unknown_methods = set(reporting_usage) - set(_METHOD_NAMES)
-    if unknown_methods:
-        raise ValueError(
-            f"reporting_usage has unknown methods: {sorted(unknown_methods)}"
-        )
-    parsed_reporting_usage = {
-        name: _parse_reporting_usage(reporting_usage.get(name, {}), method=name)
-        for name in _METHOD_NAMES
-    }
+    if reporting_usage:
+        missing_methods = set(_METHOD_NAMES) - set(reporting_usage)
+        if missing_methods:
+            raise ValueError(
+                f"reporting_usage is missing methods: {sorted(missing_methods)}"
+            )
+        unknown_methods = set(reporting_usage) - set(_METHOD_NAMES)
+        if unknown_methods:
+            raise ValueError(
+                f"reporting_usage has unknown methods: {sorted(unknown_methods)}"
+            )
+        parsed_reporting_usage = {
+            name: _parse_reporting_usage(reporting_usage[name], method=name)
+            for name in _METHOD_NAMES
+        }
+    else:
+        parsed_reporting_usage = {
+            name: _zero_reporting_usage() for name in _METHOD_NAMES
+        }
     optimization = ResourceUsage.from_mapping(optimization_usage)
     expected_ids = tuple(_task_id(task) for task in test_tasks)
     if len(set(expected_ids)) != len(expected_ids):
@@ -282,15 +321,11 @@ def run_frozen_report(
             raise TypeError(
                 f"formal evaluator returned a non-EvaluationBatch for {name}"
             )
-        if batch.split is not Split.TEST:
-            raise RuntimeError(f"formal evaluator returned a non-test batch for {name}")
-        if batch.cache_hit:
-            raise RuntimeError(f"formal evaluator returned cached results for {name}")
-        if batch.ordered_task_ids != expected_ids:
-            raise RuntimeError(f"formal test task order changed for {name}")
-        _validate_batch_usage(
-            batch.usage,
+        _validate_blind_batch(
+            batch,
             method=name,
+            expected_ids=expected_ids,
+            repetitions=report_repetitions,
             expected_rollouts=len(test_tasks) * report_repetitions,
         )
         batches[name] = batch
@@ -388,7 +423,6 @@ def run_frozen_report(
                 }
             )
 
-    output_dir.mkdir(parents=True, exist_ok=True)
     frozen_record = {
         name: {
             "skill_digest": skill.digest,
@@ -397,13 +431,6 @@ def run_frozen_report(
         }
         for name, skill in methods
     }
-    (output_dir / "frozen_method_artifacts.json").write_text(
-        json.dumps(frozen_record, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    _write_csv(output_dir / "method_comparison.csv", method_rows)
-    _write_csv(output_dir / "task_level_scores.csv", task_rows)
-    _write_csv(output_dir / "test_task_level_results.csv", task_rows)
     report = {
         "seed": report_seed,
         "test_repetitions": report_repetitions,
@@ -411,9 +438,12 @@ def run_frozen_report(
         "methods": method_rows,
         "evaluation": {"blind": True, "use_cache": False},
     }
-    (output_dir / "comparison_report.json").write_text(
-        json.dumps(report, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
+    _write_report_bundle(
+        output_dir,
+        frozen_record=frozen_record,
+        method_rows=method_rows,
+        task_rows=task_rows,
+        report=report,
     )
     return ComparisonResult(tuple(method_results), batches)
 
@@ -423,58 +453,150 @@ def _parse_reporting_usage(
 ) -> dict[str, int | float]:
     if not isinstance(value, Mapping):
         raise TypeError(f"reporting_usage.{method} must be a mapping")
-    allowed = _REPORTING_INTEGER_FIELDS | _REPORTING_NUMBER_FIELDS
+    allowed = set(_REPORTING_INTEGER_FIELDS) | set(_REPORTING_NUMBER_FIELDS)
+    missing = allowed - set(value)
+    if missing:
+        raise ValueError(
+            f"reporting_usage.{method} is missing fields: {sorted(missing)}"
+        )
     unknown = set(value) - allowed
     if unknown:
         raise ValueError(
             f"reporting_usage.{method} has unknown fields: {sorted(unknown)}"
         )
-    parsed: dict[str, int | float] = {name: 0 for name in _REPORTING_INTEGER_FIELDS}
-    parsed.update({name: 0.0 for name in _REPORTING_NUMBER_FIELDS})
+    parsed: dict[str, int | float] = {}
     for name in _REPORTING_INTEGER_FIELDS:
-        if name in value:
-            parsed[name] = _nonnegative_integer_like(
-                f"reporting_usage.{method}.{name}", value[name]
-            )
+        parsed[name] = _nonnegative_integer(
+            f"reporting_usage.{method}.{name}", value[name]
+        )
     for name in _REPORTING_NUMBER_FIELDS:
-        if name in value:
-            parsed[name] = _nonnegative_number(
-                f"reporting_usage.{method}.{name}", value[name]
-            )
+        parsed[name] = _nonnegative_number(
+            f"reporting_usage.{method}.{name}", value[name]
+        )
+    prefix = f"reporting_usage.{method}"
+    _validate_usage_totals(prefix, parsed)
+    _validate_cached_count(
+        prefix,
+        parsed,
+        cached_name="cached_student_rollouts",
+        total_name="student_rollouts",
+    )
+    _validate_cached_count(
+        prefix,
+        parsed,
+        cached_name="cached_evaluator_calls",
+        total_name="evaluator_calls",
+    )
     return parsed
 
 
-def _validate_batch_usage(
-    value: Mapping[str, Any], *, method: str, expected_rollouts: int
+def _zero_reporting_usage() -> dict[str, int | float]:
+    return {
+        **{name: 0 for name in _REPORTING_INTEGER_FIELDS},
+        **{name: 0.0 for name in _REPORTING_NUMBER_FIELDS},
+    }
+
+
+def _validate_blind_batch(
+    batch: EvaluationBatch,
+    *,
+    method: str,
+    expected_ids: tuple[str, ...],
+    repetitions: int,
+    expected_rollouts: int,
 ) -> None:
-    if not isinstance(value, Mapping):
-        raise TypeError(f"formal batch usage for {method} must be a mapping")
+    if batch.split is not Split.TEST:
+        raise RuntimeError(f"formal evaluator returned a non-test batch for {method}")
+    if type(batch.cache_hit) is not bool:
+        raise TypeError(f"formal batch for {method}.cache_hit must be a boolean")
+    if batch.cache_hit:
+        raise RuntimeError(f"formal evaluator returned cached results for {method}")
+    if type(batch.results) is not tuple:
+        raise TypeError(f"formal batch for {method}.results must be a tuple")
+    if len(batch.results) != len(expected_ids):
+        raise ValueError(
+            f"formal batch for {method}.results must contain {len(expected_ids)} items"
+        )
+    for index, (result, expected_id) in enumerate(
+        zip(batch.results, expected_ids, strict=True)
+    ):
+        prefix = f"formal batch for {method}.results[{index}]"
+        if not isinstance(result, TaskResult):
+            raise TypeError(f"{prefix} must be a TaskResult")
+        if type(result.task_id) is not str:
+            raise TypeError(f"{prefix}.task_id must be text")
+        if not result.task_id.strip():
+            raise ValueError(f"{prefix}.task_id must be non-empty")
+        if result.task_id != expected_id:
+            raise RuntimeError(f"formal test task order changed for {method}")
+        reward = _unit_number(f"{prefix}.reward", result.reward)
+        if type(result.success) is not bool:
+            raise TypeError(f"{prefix}.success must be a boolean")
+        for field_name in ("feedback", "evaluator_output", "final_answer"):
+            field_value = getattr(result, field_name)
+            if type(field_value) is not str:
+                raise TypeError(f"{prefix}.{field_name} must be text")
+            if field_value:
+                raise ValueError(
+                    f"{prefix}.{field_name} must be empty in blind reporting"
+                )
+        if type(result.visible_logs) is not tuple:
+            raise TypeError(f"{prefix}.visible_logs must be a tuple")
+        for log_index, log in enumerate(result.visible_logs):
+            if type(log) is not str:
+                raise TypeError(f"{prefix}.visible_logs[{log_index}] must be text")
+        if result.visible_logs:
+            raise ValueError(f"{prefix}.visible_logs must be empty in blind reporting")
+        if type(result.raw_rewards) is not tuple:
+            raise TypeError(f"{prefix}.raw_rewards must be a tuple")
+        if len(result.raw_rewards) != repetitions:
+            raise ValueError(f"{prefix}.raw_rewards must contain {repetitions} values")
+        raw_rewards = tuple(
+            _unit_number(f"{prefix}.raw_rewards[{raw_index}]", raw_reward)
+            for raw_index, raw_reward in enumerate(result.raw_rewards)
+        )
+        raw_mean = math.fsum(raw_rewards) / repetitions
+        if not math.isclose(raw_mean, reward, rel_tol=1e-12, abs_tol=1e-12):
+            raise ValueError(
+                f"{prefix}.raw_rewards mean {raw_mean} does not equal reward {reward}"
+            )
+
+    value = batch.usage
+    if type(value) is not dict:
+        raise TypeError(f"formal batch usage for {method} must be a dict")
+    missing = _BATCH_REQUIRED_USAGE_FIELDS - set(value)
+    if missing:
+        raise ValueError(
+            f"formal batch usage is missing fields for {method}: {sorted(missing)}"
+        )
     unknown = set(value) - _BATCH_USAGE_FIELDS
     if unknown:
         raise ValueError(
-            f"formal batch usage for {method} has unknown fields: {sorted(unknown)}"
+            f"formal batch usage has unknown fields for {method}: {sorted(unknown)}"
         )
-    if "student_rollouts" in value:
-        actual_rollouts = _nonnegative_integer(
-            f"formal batch usage for {method}.student_rollouts",
-            value["student_rollouts"],
+    actual_rollouts = _nonnegative_integer(
+        f"formal batch usage for {method}.student_rollouts",
+        value["student_rollouts"],
+    )
+    if actual_rollouts != expected_rollouts:
+        raise ValueError(
+            f"formal batch usage for {method} reported "
+            f"student_rollouts={actual_rollouts}, expected {expected_rollouts}"
         )
-        if actual_rollouts != expected_rollouts:
-            raise ValueError(
-                f"formal batch usage for {method} reported "
-                f"student_rollouts={actual_rollouts}, expected {expected_rollouts}"
-            )
     for name in ("input_tokens", "output_tokens", "total_tokens"):
-        if name in value:
-            _nonnegative_integer(f"formal batch usage for {method}.{name}", value[name])
+        _nonnegative_integer(f"formal batch usage for {method}.{name}", value[name])
+    if value["total_tokens"] != value["input_tokens"] + value["output_tokens"]:
+        raise ValueError(
+            f"formal batch usage for {method}.total_tokens must equal "
+            "input_tokens plus output_tokens"
+        )
     if "trajectory_total_tokens" in value:
         _nonnegative_integer(
             f"formal batch usage for {method}.trajectory_total_tokens",
             value["trajectory_total_tokens"],
         )
     for name in ("cost_usd", "elapsed_s"):
-        if name in value:
-            _nonnegative_number(f"formal batch usage for {method}.{name}", value[name])
+        _nonnegative_number(f"formal batch usage for {method}.{name}", value[name])
 
 
 def _formal_reporting_usage(
@@ -487,9 +609,9 @@ def _formal_reporting_usage(
     usage["student_rollouts"] += test_rollouts
     usage["evaluator_calls"] += 1
     for name in ("input_tokens", "output_tokens", "total_tokens"):
-        usage[name] += int(batch.usage.get(name, 0))
+        usage[name] += batch.usage[name]
     for name in ("cost_usd", "elapsed_s"):
-        usage[name] += float(batch.usage.get(name, 0.0))
+        usage[name] += batch.usage[name]
     return usage
 
 
@@ -515,6 +637,79 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
+def _write_json(path: Path, value: Mapping[str, Any]) -> None:
+    path.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _write_report_bundle(
+    output_dir: Path,
+    *,
+    frozen_record: Mapping[str, Any],
+    method_rows: list[dict[str, Any]],
+    task_rows: list[dict[str, Any]],
+    report: Mapping[str, Any],
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for name in _REPORT_FILE_NAMES:
+        target = output_dir / name
+        if target.exists() and not target.is_file():
+            raise ValueError(f"report target must be a file: {target}")
+
+    with tempfile.TemporaryDirectory(
+        prefix=".report-staging-", dir=output_dir
+    ) as staging_name:
+        staging_dir = Path(staging_name)
+        _write_json(staging_dir / "frozen_method_artifacts.json", frozen_record)
+        _write_csv(staging_dir / "method_comparison.csv", method_rows)
+        _write_csv(staging_dir / "task_level_scores.csv", task_rows)
+        _write_csv(staging_dir / "test_task_level_results.csv", task_rows)
+        _write_json(staging_dir / "comparison_report.json", report)
+
+        with tempfile.TemporaryDirectory(
+            prefix=".report-backup-", dir=output_dir
+        ) as backup_name:
+            _commit_staged_report(output_dir, staging_dir, Path(backup_name))
+
+
+def _commit_staged_report(
+    output_dir: Path, staging_dir: Path, backup_dir: Path
+) -> None:
+    originally_present = {
+        name: (output_dir / name).exists() for name in _REPORT_FILE_NAMES
+    }
+    backed_up: set[str] = set()
+    try:
+        for name in _REPORT_FILE_NAMES:
+            if originally_present[name]:
+                os.replace(output_dir / name, backup_dir / name)
+                backed_up.add(name)
+        for name in _REPORT_FILE_NAMES:
+            os.replace(staging_dir / name, output_dir / name)
+    except Exception as commit_error:
+        rollback_errors: list[Exception] = []
+        for name in reversed(_REPORT_FILE_NAMES):
+            target = output_dir / name
+            backup = backup_dir / name
+            try:
+                if name in backed_up:
+                    os.replace(backup, target)
+                elif not originally_present[name] and target.exists():
+                    target.unlink()
+            except Exception as rollback_error:
+                rollback_errors.append(rollback_error)
+        if rollback_errors:
+            details = "; ".join(
+                f"{type(error).__name__}: {error}" for error in rollback_errors
+            )
+            raise RuntimeError(
+                f"report commit failed and rollback was incomplete: {details}"
+            ) from commit_error
+        raise
+
+
 def _integer(name: str, value: Any) -> int:
     if type(value) is not int:
         raise TypeError(f"{name} must be an integer")
@@ -535,16 +730,6 @@ def _nonnegative_integer(name: str, value: Any) -> int:
     return result
 
 
-def _nonnegative_integer_like(name: str, value: Any) -> int:
-    if type(value) is int:
-        return _nonnegative_integer(name, value)
-    if type(value) is float and math.isfinite(value) and value.is_integer():
-        if value < 0:
-            raise ValueError(f"{name} must be nonnegative")
-        return int(value)
-    raise TypeError(f"{name} must be a nonnegative integer")
-
-
 def _number(name: str, value: Any) -> float:
     if type(value) not in {int, float}:
         raise TypeError(f"{name} must be numeric")
@@ -559,6 +744,47 @@ def _nonnegative_number(name: str, value: Any) -> float:
     if result < 0.0:
         raise ValueError(f"{name} must be nonnegative")
     return result
+
+
+def _validate_usage_totals(prefix: str, usage: Mapping[str, int | float]) -> None:
+    if usage["total_tokens"] != usage["input_tokens"] + usage["output_tokens"]:
+        raise ValueError(
+            f"{prefix}.total_tokens must equal input_tokens plus output_tokens"
+        )
+
+
+def _validate_cached_count(
+    prefix: str,
+    usage: Mapping[str, int | float],
+    *,
+    cached_name: str,
+    total_name: str,
+) -> None:
+    if usage[cached_name] > usage[total_name]:
+        raise ValueError(
+            f"{prefix}.{cached_name} must not exceed {prefix}.{total_name}"
+        )
+
+
+def _unit_number(name: str, value: Any) -> float:
+    if type(value) not in {int, float}:
+        raise TypeError(f"{name} must be numeric")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"{name} must be finite")
+    if not 0.0 <= result <= 1.0:
+        raise ValueError(f"{name} must be between zero and one")
+    return result
+
+
+def _reward_array(name: str, values: Iterable[float]) -> np.ndarray:
+    return np.asarray(
+        tuple(
+            _unit_number(f"{name}[{index}]", value)
+            for index, value in enumerate(values)
+        ),
+        dtype=float,
+    )
 
 
 __all__ = [
