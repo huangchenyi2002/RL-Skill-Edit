@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import errno
 import importlib.util
 import json
 import os
@@ -240,6 +241,47 @@ def _install_runner_startup_hook(monkeypatch, source: str) -> None:
         "rl_skill_edit.adapters.spreadsheet.subprocess.Popen",
         instrumented_popen,
     )
+
+
+def _isolation_resource_source(
+    *,
+    limits: object = (0, 0),
+    fork_errno: int | None = errno.EAGAIN,
+    uid: int = 1_000,
+    euid: int = 1_000,
+    cap_eff: str = "0",
+    missing_os_function: str | None = None,
+) -> str:
+    status = f"Name:\ttest\nCapEff:\t{cap_eff}\n"
+    source = (
+        "import builtins\n"
+        "import io\n"
+        "import os\n"
+        "import sys\n"
+        "RLIMIT_NPROC = 1\n"
+        "def setrlimit(*args, **kwargs):\n"
+        "    pass\n"
+        "def getrlimit(*args, **kwargs):\n"
+        f"    return {limits!r}\n"
+        f"os.getuid = lambda: {uid!r}\n"
+        f"os.geteuid = lambda: {euid!r}\n"
+        "sys.platform = 'linux'\n"
+        "_real_open = builtins.open\n"
+        "def _patched_open(file, *args, **kwargs):\n"
+        "    if os.fspath(file) == '/proc/self/status':\n"
+        f"        return io.StringIO({status!r})\n"
+        "    return _real_open(file, *args, **kwargs)\n"
+        "builtins.open = _patched_open\n"
+    )
+    if fork_errno is not None:
+        source += (
+            "def _probe_fork():\n"
+            f"    raise OSError({fork_errno!r}, 'probe failure')\n"
+            "os.fork = _probe_fork\n"
+        )
+    if missing_os_function is not None:
+        source += f"delattr(os, {missing_os_function!r})\n"
+    return source
 
 
 def _final_task(tmp_path: Path) -> dict:
@@ -1357,6 +1399,94 @@ def test_executor_prevents_detached_descendants_for_every_exit_path(
 
 
 @pytest.mark.skipif(os.name == "nt", reason="fork self-probe is POSIX-only")
+def test_executor_runs_student_after_eagain_probe(tmp_path: Path, monkeypatch) -> None:
+    init_file = tmp_path / "input.xlsx"
+    golden_file = tmp_path / "golden.xlsx"
+    student_marker = tmp_path / "student-ran.txt"
+    _write_workbook(init_file, "same")
+    _write_workbook(golden_file, "same")
+    _install_runner_startup_hook(
+        monkeypatch,
+        _isolation_resource_source(fork_errno=errno.EAGAIN),
+    )
+
+    result = SpreadsheetExecutor().execute_and_score(
+        code=(
+            "from pathlib import Path\n"
+            f"Path({str(student_marker)!r}).write_text('ran')\n"
+        ),
+        init_file=str(init_file),
+        golden_file=str(golden_file),
+        answer_position="A1",
+        answer_sheet="SECRET_FINAL_SHEET",
+    )
+
+    assert result == ExecutionResult(1.0, 1, 1)
+    assert student_marker.read_text(encoding="utf-8") == "ran"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="fork self-probe is POSIX-only")
+@pytest.mark.parametrize(
+    "resource_source",
+    [
+        pytest.param(
+            _isolation_resource_source(limits=(1, 0)),
+            id="limits-not-zero",
+        ),
+        pytest.param(
+            _isolation_resource_source(fork_errno=errno.ENOMEM),
+            id="fork-enomem",
+        ),
+        pytest.param(
+            _isolation_resource_source(uid=0),
+            id="real-uid-root",
+        ),
+        pytest.param(
+            _isolation_resource_source(euid=0),
+            id="effective-uid-root",
+        ),
+        pytest.param(
+            _isolation_resource_source(cap_eff=f"{1 << 21:x}"),
+            id="cap-sys-admin",
+        ),
+        pytest.param(
+            _isolation_resource_source(cap_eff=f"{1 << 24:x}"),
+            id="cap-sys-resource",
+        ),
+        pytest.param(
+            _isolation_resource_source(cap_eff="not-hex"),
+            id="invalid-cap-eff",
+        ),
+    ],
+)
+def test_executor_fails_closed_when_process_isolation_is_unverified(
+    tmp_path: Path,
+    monkeypatch,
+    resource_source: str,
+) -> None:
+    init_file = tmp_path / "input.xlsx"
+    golden_file = tmp_path / "golden.xlsx"
+    student_marker = tmp_path / "student-ran.txt"
+    _write_workbook(init_file, "same")
+    _write_workbook(golden_file, "same")
+    _install_runner_startup_hook(monkeypatch, resource_source)
+
+    result = SpreadsheetExecutor().execute_and_score(
+        code=(
+            "from pathlib import Path\n"
+            f"Path({str(student_marker)!r}).write_text('ran')\n"
+        ),
+        init_file=str(init_file),
+        golden_file=str(golden_file),
+        answer_position="A1",
+        answer_sheet="SECRET_FINAL_SHEET",
+    )
+
+    assert "process_isolation_unavailable" in result.error
+    assert not student_marker.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="fork self-probe is POSIX-only")
 def test_executor_fails_closed_and_reaps_probe_when_rlimit_is_ineffective(
     tmp_path: Path,
     monkeypatch,
@@ -1370,12 +1500,9 @@ def test_executor_fails_closed_and_reaps_probe_when_rlimit_is_ineffective(
     _write_workbook(golden_file, "same")
     _install_runner_startup_hook(
         monkeypatch,
-        (
-            "import os\n"
+        _isolation_resource_source(fork_errno=None)
+        + (
             "from pathlib import Path\n"
-            "RLIMIT_NPROC = 1\n"
-            "def setrlimit(*args, **kwargs):\n"
-            "    pass\n"
             "_real_fork = os.fork\n"
             "_real_waitpid = os.waitpid\n"
             "def _tracked_fork():\n"
@@ -1420,9 +1547,14 @@ def test_executor_fails_closed_and_reaps_probe_when_rlimit_is_ineffective(
 
 
 @pytest.mark.skipif(os.name == "nt", reason="fork self-probe is POSIX-only")
-def test_executor_fails_closed_when_posix_fork_is_unavailable(
+@pytest.mark.parametrize(
+    "function_name",
+    ["getuid", "geteuid", "fork", "waitpid"],
+)
+def test_executor_fails_closed_when_posix_function_is_unavailable(
     tmp_path: Path,
     monkeypatch,
+    function_name: str,
 ) -> None:
     init_file = tmp_path / "input.xlsx"
     golden_file = tmp_path / "golden.xlsx"
@@ -1431,12 +1563,8 @@ def test_executor_fails_closed_when_posix_fork_is_unavailable(
     _write_workbook(golden_file, "same")
     _install_runner_startup_hook(
         monkeypatch,
-        (
-            "import os\n"
-            "RLIMIT_NPROC = 1\n"
-            "def setrlimit(*args, **kwargs):\n"
-            "    pass\n"
-            "del os.fork\n"
+        _isolation_resource_source(
+            missing_os_function=function_name,
         ),
     )
 
