@@ -1107,60 +1107,129 @@ def _validate_staged_output(
                 raise ValueError(f"staging path leaked into persisted artifact: {path}")
 
 
+def _previous_output_path(output_dir: Path) -> Path:
+    return output_dir.parent / f".{output_dir.name}.previous"
+
+
 def _restore_backup(
-    backup: Path, output_dir: Path, *, expected_fingerprint: str
+    previous: Path, output_dir: Path, *, expected_fingerprint: str
 ) -> None:
-    os.replace(backup, output_dir)
+    if _tree_fingerprint(previous) != expected_fingerprint:
+        raise RuntimeError("previous output fingerprint changed before restoration")
+    if os.path.lexists(output_dir):
+        raise RuntimeError("cannot restore previous output over an existing target")
+    os.replace(previous, output_dir)
     if _tree_fingerprint(output_dir) != expected_fingerprint:
         raise RuntimeError("restored output fingerprint changed")
+
+
+def _move_failed_install_to_staging(staging: Path, output_dir: Path) -> None:
+    if not os.path.lexists(output_dir):
+        return
+    if os.path.lexists(staging):
+        raise RuntimeError("failed install left both staging and final output present")
+    os.replace(output_dir, staging)
 
 
 def _commit_output_tree(staging: Path, output_dir: Path) -> None:
     _validate_real_tree(staging, name="staging output")
     _ensure_real_directory(output_dir.parent, name="output parent")
     _allow_directory(output_dir, name="final output")
+    previous = _previous_output_path(output_dir)
+    if os.path.lexists(previous):
+        _validate_real_tree(previous, name="previous output snapshot")
+        _remove_tree(previous)
+        if os.path.lexists(previous):
+            raise RuntimeError("previous output cleanup was incomplete")
+
     had_output = os.path.lexists(output_dir)
     previous_fingerprint = _tree_fingerprint(output_dir) if had_output else ""
-    backup = output_dir.parent / f".rl-output-backup-{os.urandom(12).hex()}"
     if had_output:
-        os.replace(output_dir, backup)
-    try:
-        os.replace(staging, output_dir)
-    except BaseException:
-        if had_output:
+        try:
+            os.replace(output_dir, previous)
+        except BaseException:
+            if os.path.lexists(previous) and not os.path.lexists(output_dir):
+                try:
+                    _restore_backup(
+                        previous,
+                        output_dir,
+                        expected_fingerprint=previous_fingerprint,
+                    )
+                except BaseException as rollback_error:
+                    raise OutputRollbackError(
+                        "output snapshot failed and restoration failed; evidence "
+                        f"retained at staging={staging}, previous={previous}, "
+                        f"output={output_dir}"
+                    ) from rollback_error
+            raise
+        try:
+            if _tree_fingerprint(previous) != previous_fingerprint:
+                raise RuntimeError("previous output snapshot fingerprint changed")
+        except BaseException as snapshot_error:
             try:
                 _restore_backup(
-                    backup,
+                    previous,
                     output_dir,
                     expected_fingerprint=previous_fingerprint,
                 )
             except BaseException as rollback_error:
                 raise OutputRollbackError(
-                    "output install failed and rollback failed; evidence retained at "
-                    f"staging={staging}, backup={backup}, output={output_dir}"
+                    "output snapshot validation failed and restoration failed; "
+                    f"evidence retained at staging={staging}, previous={previous}, "
+                    f"output={output_dir}"
                 ) from rollback_error
-        raise
-
-    if not had_output:
-        return
+            raise RuntimeError(
+                "output snapshot validation failed; previous output was restored"
+            ) from snapshot_error
     try:
-        _remove_tree(backup)
-    except BaseException as cleanup_error:
+        os.replace(staging, output_dir)
+    except BaseException as install_error:
+        try:
+            _move_failed_install_to_staging(staging, output_dir)
+        except BaseException as preserve_error:
+            raise OutputRollbackError(
+                "output install failed and the candidate output could not be "
+                f"preserved; evidence at staging={staging}, previous={previous}, "
+                f"output={output_dir}"
+            ) from preserve_error
+        if had_output:
+            try:
+                _restore_backup(
+                    previous,
+                    output_dir,
+                    expected_fingerprint=previous_fingerprint,
+                )
+            except BaseException as rollback_error:
+                raise OutputRollbackError(
+                    "output install failed and restoration failed; evidence retained "
+                    f"at staging={staging}, previous={previous}, output={output_dir}"
+                ) from rollback_error
+        raise install_error
+
+    previous_validation_error: BaseException | None = None
+    if had_output:
+        try:
+            if _tree_fingerprint(previous) != previous_fingerprint:
+                previous_validation_error = RuntimeError(
+                    "committed previous snapshot fingerprint changed"
+                )
+        except BaseException as validation_error:
+            previous_validation_error = validation_error
+    if previous_validation_error is not None:
         try:
             os.replace(output_dir, staging)
             _restore_backup(
-                backup,
+                previous,
                 output_dir,
                 expected_fingerprint=previous_fingerprint,
             )
         except BaseException as rollback_error:
             raise OutputRollbackError(
-                "backup cleanup failed and rollback failed; evidence retained at "
-                f"staging={staging}, backup={backup}, output={output_dir}"
+                "committed previous snapshot changed and restoration failed; "
+                f"evidence retained at staging={staging}, previous={previous}, "
+                f"output={output_dir}"
             ) from rollback_error
-        raise RuntimeError(
-            "backup cleanup failed; previous output was restored"
-        ) from cleanup_error
+        raise previous_validation_error
 
 
 def _train_rl(

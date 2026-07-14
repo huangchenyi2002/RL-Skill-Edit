@@ -107,6 +107,10 @@ def _tree_snapshot(path: Path) -> dict[str, tuple[Any, ...]]:
     return snapshot
 
 
+def _previous_output_path(output_dir: Path) -> Path:
+    return output_dir.parent / f".{output_dir.name}.previous"
+
+
 def test_parser_has_only_the_fixed_rl_flags() -> None:
     args = parse_args(["--config", "config.yaml", "--seed", "9", "--test-only"])
     assert args.config == Path("config.yaml")
@@ -567,6 +571,75 @@ def test_training_bundle_commit_failure_rolls_back_existing_files(
     with pytest.raises(OSError, match="injected bundle"):
         run(config_path, seed=42)
     assert _tree_snapshot(output_dir) == before
+    assert not os.path.lexists(_previous_output_path(output_dir))
+
+
+def test_successful_retraining_keeps_complete_previous_output_snapshot(
+    tmp_path: Path,
+) -> None:
+    config_path = _smoke_config_in(tmp_path)
+    trained = run(config_path, seed=42)
+    output_dir = Path(trained["output_dir"])
+    before = _tree_snapshot(output_dir)
+    before_fingerprint = cli._tree_fingerprint(output_dir)
+
+    run(config_path, seed=43)
+
+    previous = _previous_output_path(output_dir)
+    assert _tree_snapshot(previous) == before
+    assert cli._tree_fingerprint(previous) == before_fingerprint
+
+
+def test_post_install_previous_validation_failure_restores_current_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = _smoke_config_in(tmp_path)
+    trained = run(config_path, seed=42)
+    output_dir = Path(trained["output_dir"])
+    previous = _previous_output_path(output_dir)
+    before = _tree_snapshot(output_dir)
+    original_fingerprint = cli._tree_fingerprint
+    previous_checks = 0
+
+    def fail_second_previous_check(path: Path) -> str:
+        nonlocal previous_checks
+        if path == previous:
+            previous_checks += 1
+            if previous_checks == 2:
+                raise OSError("injected post-install previous validation failure")
+        return original_fingerprint(path)
+
+    monkeypatch.setattr(cli, "_tree_fingerprint", fail_second_previous_check)
+
+    with pytest.raises(OSError, match="post-install previous validation"):
+        run(config_path, seed=43)
+    assert _tree_snapshot(output_dir) == before
+    assert not os.path.lexists(previous)
+    assert not tuple(tmp_path.glob(".rl-output-staging-*"))
+
+
+@pytest.mark.parametrize("kind", ("symlink", "special"))
+def test_previous_snapshot_rejects_links_and_special_files_before_commit(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    config_path = _smoke_config_in(tmp_path)
+    trained = run(config_path, seed=42)
+    output_dir = Path(trained["output_dir"])
+    previous = _previous_output_path(output_dir)
+    before = _tree_snapshot(output_dir)
+    if kind == "symlink":
+        external = tmp_path / "external-previous"
+        external.mkdir()
+        previous.symlink_to(external, target_is_directory=True)
+    else:
+        os.mkfifo(previous)
+
+    with pytest.raises(ValueError):
+        run(config_path, seed=43)
+    assert _tree_snapshot(output_dir) == before
+    assert os.path.lexists(previous)
 
 
 def test_manifest_write_failure_preserves_entire_previous_output(
@@ -649,26 +722,35 @@ def test_test_only_report_failure_preserves_entire_output(
     assert _tree_snapshot(output_dir) == before
 
 
-def test_backup_cleanup_failure_restores_entire_previous_output(
+@pytest.mark.parametrize("test_only", (False, True))
+def test_partial_previous_cleanup_failure_preserves_current_output(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    test_only: bool,
 ) -> None:
     config_path = _smoke_config_in(tmp_path)
     trained = run(config_path, seed=42)
     output_dir = Path(trained["output_dir"])
+    run(config_path, seed=42, test_only=True)
+    previous = _previous_output_path(output_dir)
+    assert previous.is_dir()
     before = _tree_snapshot(output_dir)
+    previous_before = _tree_snapshot(previous)
     original_remove = cli._remove_tree
 
-    def fail_backup_cleanup(path: Path) -> None:
-        if path.name.startswith(".rl-output-backup-"):
-            raise OSError("injected backup cleanup failure")
+    def partially_remove_previous(path: Path) -> None:
+        if path == previous:
+            (path / "experiment_manifest.json").unlink()
+            raise OSError("injected partial previous cleanup failure")
         original_remove(path)
 
-    monkeypatch.setattr(cli, "_remove_tree", fail_backup_cleanup)
+    monkeypatch.setattr(cli, "_remove_tree", partially_remove_previous)
 
-    with pytest.raises(RuntimeError, match="backup cleanup"):
-        run(config_path, seed=42)
+    with pytest.raises(OSError, match="partial previous cleanup"):
+        run(config_path, seed=42 if test_only else 43, test_only=test_only)
     assert _tree_snapshot(output_dir) == before
+    assert os.path.lexists(previous)
+    assert _tree_snapshot(previous) != previous_before
 
 
 def test_install_and_rollback_failure_retains_explicit_evidence(
@@ -685,7 +767,7 @@ def test_install_and_rollback_failure_retains_explicit_evidence(
         target_path = Path(target)
         if target_path == output_dir and (
             source_path.name.startswith(".rl-output-staging-")
-            or source_path.name.startswith(".rl-output-backup-")
+            or source_path == _previous_output_path(output_dir)
         ):
             raise OSError("injected install or rollback failure")
         real_replace(source, target)
@@ -696,4 +778,4 @@ def test_install_and_rollback_failure_retains_explicit_evidence(
         run(config_path, seed=42)
     assert not os.path.lexists(output_dir)
     assert tuple(tmp_path.glob(".rl-output-staging-*"))
-    assert tuple(tmp_path.glob(".rl-output-backup-*"))
+    assert _previous_output_path(output_dir).is_dir()

@@ -35,8 +35,12 @@ only one optimization method: `rl_skill_edit`.
 1. The CLI accepts only `--config`, `--seed`, and `--test-only`.
 2. Training loads Train and Validation first, optimizes inside a staging bundle,
    then loads Test only after Validation has selected the frozen Skill.
-3. The frozen bundle is committed as one directory. Failed writes or directory
-   replacement restore the previous bundle.
+3. The complete RL bundle, five reports, cache, and experiment manifest are
+   committed as one output tree. A successful replacement keeps the prior tree
+   at `.<output-name>.previous`; the next commit validates and removes that
+   snapshot before touching the current output. Failed installation restores the
+   verified snapshot, while failed snapshot cleanup leaves the current output
+   unchanged.
 4. Freeze provenance binds the Skill digest, normalized config, all three split
    digests, every `rl_skill_edit/**/*.py` file, `requirements.txt`, and the seed.
 5. `--test-only` rejects any missing, unknown, or mismatched provenance field.
