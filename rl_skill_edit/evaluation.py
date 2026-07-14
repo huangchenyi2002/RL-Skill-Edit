@@ -75,9 +75,7 @@ def _task_cache_identity(task: Any) -> dict[str, Any]:
             "entity_fingerprint": str(task["_entity_fingerprint"]),
             "content_fingerprint": str(task["_content_fingerprint"]),
         }
-    normalized = json.loads(
-        json.dumps(dict(task), ensure_ascii=False, sort_keys=True)
-    )
+    normalized = json.loads(json.dumps(dict(task), ensure_ascii=False, sort_keys=True))
     spreadsheet = normalized.get("spreadsheet")
     if isinstance(spreadsheet, dict):
         for key in ("init_file", "golden_file"):
@@ -94,36 +92,122 @@ def _batch_to_dict(batch: EvaluationBatch) -> dict[str, Any]:
     }
 
 
+def _strict_unit_number(value: Any, name: str) -> int | float:
+    if type(value) not in {int, float}:
+        raise TypeError(f"{name} must be a JSON number")
+    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+        raise ValueError(f"{name} must be finite and between 0 and 1")
+    return value
+
+
+def _strict_usage(payload: Any) -> dict[str, int | float]:
+    if type(payload) is not dict:
+        raise TypeError("cached usage must be a JSON object")
+    integer_fields = {
+        "student_rollouts",
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+    }
+    optional_integer_fields = {"trajectory_total_tokens"}
+    number_fields = {"cost_usd", "elapsed_s"}
+    required_fields = integer_fields | number_fields
+    missing = required_fields - payload.keys()
+    if missing:
+        raise ValueError(f"cached usage is missing fields: {sorted(missing)}")
+    unknown = payload.keys() - required_fields - optional_integer_fields
+    if unknown:
+        raise ValueError(f"cached usage has unknown fields: {sorted(unknown)}")
+    for field_name in integer_fields | optional_integer_fields:
+        if field_name not in payload:
+            continue
+        value = payload[field_name]
+        if type(value) is not int or value < 0:
+            raise TypeError(f"cached usage.{field_name} must be a non-negative integer")
+    for field_name in number_fields:
+        value = payload[field_name]
+        if type(value) not in {int, float} or not math.isfinite(value) or value < 0.0:
+            raise TypeError(
+                f"cached usage.{field_name} must be finite and non-negative"
+            )
+    return dict(payload)
+
+
 def _batch_from_dict(payload: dict[str, Any], *, cache_hit: bool) -> EvaluationBatch:
-    results = tuple(
-        TaskResult(
-            task_id=str(item["task_id"]),
-            reward=float(item["reward"]),
-            success=bool(item["success"]),
-            feedback=str(item.get("feedback", "")),
-            evaluator_output=str(item.get("evaluator_output", "")),
-            final_answer=str(item.get("final_answer", "")),
-            visible_logs=tuple(str(value) for value in item.get("visible_logs", ())),
-            raw_rewards=tuple(float(value) for value in item.get("raw_rewards", ())),
+    if type(payload) is not dict:
+        raise TypeError("cached evaluation must be a JSON object")
+    split_value = payload.get("split")
+    if type(split_value) is not str:
+        raise TypeError("cached split must be a string")
+    result_payloads = payload.get("results")
+    if type(result_payloads) is not list:
+        raise TypeError("cached results must be a JSON array")
+    results = []
+    for index, item in enumerate(result_payloads):
+        if type(item) is not dict:
+            raise TypeError(f"cached results[{index}] must be a JSON object")
+        task_id = item.get("task_id")
+        if type(task_id) is not str or not task_id.strip():
+            raise ValueError(f"cached results[{index}].task_id must be non-empty text")
+        success = item.get("success")
+        if type(success) is not bool:
+            raise TypeError(f"cached results[{index}].success must be a boolean")
+        text_fields = {}
+        for field_name in ("feedback", "evaluator_output", "final_answer"):
+            value = item.get(field_name)
+            if type(value) is not str:
+                raise TypeError(f"cached results[{index}].{field_name} must be text")
+            text_fields[field_name] = value
+        visible_logs = item.get("visible_logs")
+        if type(visible_logs) is not list or not all(
+            type(value) is str for value in visible_logs
+        ):
+            raise TypeError(
+                f"cached results[{index}].visible_logs must be a text array"
+            )
+        raw_reward_values = item.get("raw_rewards")
+        if type(raw_reward_values) is not list:
+            raise TypeError(
+                f"cached results[{index}].raw_rewards must be a number array"
+            )
+        raw_rewards = tuple(
+            _strict_unit_number(
+                value,
+                f"cached results[{index}].raw_rewards[{reward_index}]",
+            )
+            for reward_index, value in enumerate(raw_reward_values)
         )
-        for item in payload["results"]
-    )
+        results.append(
+            TaskResult(
+                task_id=task_id,
+                reward=_strict_unit_number(
+                    item.get("reward"),
+                    f"cached results[{index}].reward",
+                ),
+                success=success,
+                feedback=text_fields["feedback"],
+                evaluator_output=text_fields["evaluator_output"],
+                final_answer=text_fields["final_answer"],
+                visible_logs=tuple(visible_logs),
+                raw_rewards=raw_rewards,
+            )
+        )
+    usage = _strict_usage(payload.get("usage"))
+    cache_hit_usage = {
+        "student_rollouts": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "cost_usd": 0.0,
+        "elapsed_s": 0.0,
+    }
+    if "trajectory_total_tokens" in usage:
+        cache_hit_usage["trajectory_total_tokens"] = 0
     return EvaluationBatch(
-        split=Split(payload["split"]),
-        results=results,
+        split=Split(split_value),
+        results=tuple(results),
         cache_hit=cache_hit,
-        usage=(
-            {
-                "student_rollouts": 0,
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "total_tokens": 0,
-                "cost_usd": 0.0,
-                "elapsed_s": 0.0,
-            }
-            if cache_hit
-            else dict(payload.get("usage") or {})
-        ),
+        usage=cache_hit_usage if cache_hit else usage,
     )
 
 
@@ -328,7 +412,17 @@ class SpreadsheetSkillEvaluator:
             "rl-skill-edit-spreadsheet-v1",
             self.cache_signature,
         )
-        return self.cache.get("rollout", key) is not None
+        cached = self.cache.get("rollout", key)
+        if cached is None:
+            return False
+        _validated_cached_batch(
+            cached,
+            split=split,
+            tasks=tasks,
+            repetitions=repetitions,
+            success_threshold=self.success_threshold,
+        )
+        return True
 
     def evaluate(
         self,
@@ -362,24 +456,13 @@ class SpreadsheetSkillEvaluator:
         if use_cache and self.cache is not None:
             cached = self.cache.get("rollout", key)
             if cached is not None:
-                try:
-                    cached_batch = _batch_from_dict(cached, cache_hit=True)
-                except (KeyError, OverflowError, TypeError, ValueError) as exc:
-                    raise RuntimeError(
-                        f"incomplete cached evaluation bundle: {exc}"
-                    ) from exc
-                cache_error = _cached_bundle_error(
-                    cached_batch,
+                return _validated_cached_batch(
+                    cached,
                     split=split,
                     tasks=tasks,
                     repetitions=repetitions,
                     success_threshold=self.success_threshold,
                 )
-                if cache_error:
-                    raise RuntimeError(
-                        f"incomplete cached evaluation bundle: {cache_error}"
-                    )
-                return cached_batch
 
         client = getattr(self.student, "client", None)
         has_client_usage = client is not None and all(
@@ -390,12 +473,8 @@ class SpreadsheetSkillEvaluator:
                 "total_cost_usd",
             )
         )
-        input_before = (
-            int(client.total_input_tokens) if has_client_usage else 0
-        )
-        output_before = (
-            int(client.total_output_tokens) if has_client_usage else 0
-        )
+        input_before = int(client.total_input_tokens) if has_client_usage else 0
+        output_before = int(client.total_output_tokens) if has_client_usage else 0
         cost_before = float(client.total_cost_usd) if has_client_usage else 0.0
         started = time.monotonic()
         results: list[TaskResult] = []
@@ -476,9 +555,7 @@ class SpreadsheetSkillEvaluator:
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
                 "total_tokens": (
-                    input_tokens + output_tokens
-                    if has_client_usage
-                    else total_tokens
+                    input_tokens + output_tokens if has_client_usage else total_tokens
                 ),
                 "trajectory_total_tokens": total_tokens,
                 "cost_usd": client_cost_usd,
@@ -501,7 +578,8 @@ def _trajectory_bundle_error(trajectory: Any, expected_task_id: str) -> str:
         if (
             isinstance(value, bool)
             or not isinstance(value, (int, float))
-            or not math.isfinite(float(value))
+            or not math.isfinite(value)
+            or not 0.0 <= value <= 1.0
         ):
             return f"invalid {field_name}"
     total_tokens = getattr(trajectory, "total_tokens", None)
@@ -521,6 +599,8 @@ def _trajectory_bundle_error(trajectory: Any, expected_task_id: str) -> str:
         return "invalid total_cost_usd"
     if not isinstance(getattr(trajectory, "final_answer", None), str):
         return "invalid final_answer"
+    if not isinstance(getattr(trajectory, "invalid_reason", None), str):
+        return "invalid invalid_reason"
     visible_logs = getattr(trajectory, "visible_logs", None)
     if not isinstance(visible_logs, tuple) or not all(
         isinstance(log, str) for log in visible_logs
@@ -545,19 +625,42 @@ def _cached_bundle_error(
     for result in batch.results:
         if len(result.raw_rewards) != repetitions:
             return f"cached repetition count is incomplete for {result.task_id}"
-        if not all(math.isfinite(value) for value in result.raw_rewards):
+        if not 0.0 <= result.reward <= 1.0:
+            return f"cached reward is outside [0, 1] for {result.task_id}"
+        if not all(
+            math.isfinite(value) and 0.0 <= value <= 1.0 for value in result.raw_rewards
+        ):
             return f"cached reward is non-finite for {result.task_id}"
         expected_reward = sum(result.raw_rewards) / repetitions
-        if not math.isclose(
-            result.reward,
-            expected_reward,
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        ):
+        if result.reward != expected_reward:
             return f"cached mean reward is inconsistent for {result.task_id}"
         if result.success is not (result.reward >= success_threshold):
             return f"cached success flag is inconsistent for {result.task_id}"
     return ""
+
+
+def _validated_cached_batch(
+    payload: Any,
+    *,
+    split: Split,
+    tasks: tuple[Mapping[str, Any], ...],
+    repetitions: int,
+    success_threshold: float,
+) -> EvaluationBatch:
+    try:
+        batch = _batch_from_dict(payload, cache_hit=True)
+    except (KeyError, OverflowError, TypeError, ValueError) as exc:
+        raise RuntimeError(f"incomplete cached evaluation bundle: {exc}") from exc
+    cache_error = _cached_bundle_error(
+        batch,
+        split=split,
+        tasks=tasks,
+        repetitions=repetitions,
+        success_threshold=success_threshold,
+    )
+    if cache_error:
+        raise RuntimeError(f"incomplete cached evaluation bundle: {cache_error}")
+    return batch
 
 
 __all__ = [

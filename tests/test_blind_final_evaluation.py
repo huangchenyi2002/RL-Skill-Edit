@@ -2,15 +2,17 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import json
 import os
 import signal
 import subprocess
-import time
+from datetime import datetime
 from pathlib import Path
 from types import MappingProxyType
 
 import pytest
 from openpyxl import Workbook, load_workbook
+from openpyxl.styles import PatternFill
 
 import rl_skill_edit.evaluation as evaluation
 from rl_skill_edit.adapters.spreadsheet import (
@@ -65,12 +67,27 @@ class RecordingClient:
         return response, usage
 
 
-def _write_workbook(path: Path, value: str) -> None:
+def _write_workbook(path: Path, value: object) -> None:
     workbook = Workbook()
     worksheet = workbook.active
     worksheet.title = "SECRET_FINAL_SHEET"
     worksheet["A1"] = value
     workbook.save(path)
+
+
+def _execute_without_editing(
+    init_file: Path,
+    golden_file: Path,
+    *,
+    answer_position: str = "A1",
+) -> ExecutionResult:
+    return SpreadsheetExecutor().execute_and_score(
+        code="pass",
+        init_file=str(init_file),
+        golden_file=str(golden_file),
+        answer_position=answer_position,
+        answer_sheet="SECRET_FINAL_SHEET",
+    )
 
 
 def _process_exists(process_id: int) -> bool:
@@ -79,15 +96,6 @@ def _process_exists(process_id: int) -> bool:
     except ProcessLookupError:
         return False
     return True
-
-
-def _wait_for_process_exit(process_id: int, timeout: float = 1.0) -> bool:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if not _process_exists(process_id):
-            return True
-        time.sleep(0.01)
-    return not _process_exists(process_id)
 
 
 def _final_task(tmp_path: Path) -> dict:
@@ -244,9 +252,7 @@ def test_select_score_is_local_and_clamps_mixed_weight(
     weight: float,
     expected: float,
 ) -> None:
-    assert evaluation.select_score(0.2, 0.8, metric, weight) == pytest.approx(
-        expected
-    )
+    assert evaluation.select_score(0.2, 0.8, metric, weight) == pytest.approx(expected)
 
 
 def test_select_score_rejects_an_unknown_metric() -> None:
@@ -345,6 +351,55 @@ def test_spreadsheet_evaluator_rejects_an_incomplete_bundle_immediately(
         )
 
     assert len(student.calls) == 2
+
+
+@pytest.mark.parametrize(
+    ("reward_field", "invalid_value"),
+    [
+        ("hard_reward", -0.01),
+        ("hard_reward", 1.01),
+        ("soft_reward", -0.01),
+        ("soft_reward", 1.01),
+    ],
+)
+def test_spreadsheet_evaluator_rejects_live_rewards_outside_unit_interval(
+    tmp_path: Path,
+    reward_field: str,
+    invalid_value: float,
+) -> None:
+    student = RecordingStudent()
+
+    def invalid_run_task(task, skill, *, blind, seed):
+        values = {"hard_reward": 0.5, "soft_reward": 0.5}
+        values[reward_field] = invalid_value
+        return StudentTrajectory(
+            task_id=task["task_id"],
+            hard_reward=values["hard_reward"],
+            soft_reward=values["soft_reward"],
+            final_answer="answer",
+            visible_logs=(),
+            total_tokens=1,
+            total_cost_usd=0.0,
+        )
+
+    student.run_task = invalid_run_task
+    evaluator = evaluation.SpreadsheetSkillEvaluator(
+        student,
+        cache=None,
+        gate_metric="hard",
+        gate_mixed_weight=0.5,
+    )
+
+    with pytest.raises(RuntimeError, match=f"invalid {reward_field}"):
+        evaluator.evaluate(
+            SkillArtifact("main", "main", "", "## Rule\nUpdate cells."),
+            (_evaluation_task(tmp_path, "task-a"),),
+            split=Split.TRAIN,
+            seed=10,
+            repetitions=1,
+            use_cache=False,
+            blind=False,
+        )
 
 
 def test_spreadsheet_evaluator_requires_freeze_before_test(
@@ -460,16 +515,142 @@ def test_spreadsheet_evaluator_rejects_an_incomplete_cached_bundle(
         "blind": False,
     }
     evaluator.evaluate(**kwargs)
-    payload = __import__("json").loads(cache_path.read_text(encoding="utf-8"))
+    payload = json.loads(cache_path.read_text(encoding="utf-8"))
     cached_batch = next(iter(payload["rollout"].values()))
     if tamper == "task_order":
         cached_batch["results"].reverse()
     else:
         cached_batch["results"][0]["raw_rewards"].pop()
     cache_path.write_text(
-        __import__("json").dumps(payload),
+        json.dumps(payload),
         encoding="utf-8",
     )
+    student.calls.clear()
+
+    with pytest.raises(RuntimeError, match="incomplete cached evaluation bundle"):
+        evaluator.evaluate(**kwargs)
+    assert student.calls == []
+
+
+def test_spreadsheet_evaluator_rejects_coerced_cached_result_fields(
+    tmp_path: Path,
+) -> None:
+    cache_path = tmp_path / "rollouts.json"
+    student = RecordingStudent()
+    evaluator = evaluation.SpreadsheetSkillEvaluator(
+        student,
+        cache=JsonFileCache(cache_path),
+        gate_metric="soft",
+        gate_mixed_weight=0.5,
+    )
+    kwargs = {
+        "skill": SkillArtifact("main", "main", "", "## Rule\nUpdate cells."),
+        "tasks": (_evaluation_task(tmp_path, "task-a"),),
+        "split": Split.TRAIN,
+        "seed": 500,
+        "repetitions": 1,
+        "use_cache": True,
+        "blind": False,
+    }
+    evaluator.evaluate(**kwargs)
+    payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    result = next(iter(payload["rollout"].values()))["results"][0]
+    result["reward"] = "2"
+    result["success"] = "yes"
+    result["raw_rewards"] = ["2"]
+    cache_path.write_text(json.dumps(payload), encoding="utf-8")
+    student.calls.clear()
+
+    with pytest.raises(RuntimeError, match="incomplete cached evaluation bundle"):
+        evaluator.cache_will_hit(
+            **{key: value for key, value in kwargs.items() if key != "use_cache"}
+        )
+    with pytest.raises(RuntimeError, match="incomplete cached evaluation bundle"):
+        evaluator.evaluate(**kwargs)
+    assert student.calls == []
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value", "task_id"),
+    [
+        ("task_id", 7, "7"),
+        ("feedback", 7, "task-a"),
+        ("evaluator_output", {}, "task-a"),
+        ("final_answer", 7, "task-a"),
+        ("visible_logs", [7], "task-a"),
+    ],
+)
+def test_spreadsheet_evaluator_rejects_non_text_cached_fields(
+    tmp_path: Path,
+    field: str,
+    invalid_value: object,
+    task_id: str,
+) -> None:
+    cache_path = tmp_path / "rollouts.json"
+    student = RecordingStudent()
+    evaluator = evaluation.SpreadsheetSkillEvaluator(
+        student,
+        cache=JsonFileCache(cache_path),
+        gate_metric="hard",
+        gate_mixed_weight=0.5,
+    )
+    kwargs = {
+        "skill": SkillArtifact("main", "main", "", "## Rule\nUpdate cells."),
+        "tasks": (_evaluation_task(tmp_path, task_id),),
+        "split": Split.TRAIN,
+        "seed": 10,
+        "repetitions": 1,
+        "use_cache": True,
+        "blind": False,
+    }
+    evaluator.evaluate(**kwargs)
+    payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    result = next(iter(payload["rollout"].values()))["results"][0]
+    result[field] = invalid_value
+    cache_path.write_text(json.dumps(payload), encoding="utf-8")
+    student.calls.clear()
+
+    with pytest.raises(RuntimeError, match="incomplete cached evaluation bundle"):
+        evaluator.evaluate(**kwargs)
+    assert student.calls == []
+
+
+@pytest.mark.parametrize(
+    ("usage_field", "invalid_value"),
+    [
+        ("student_rollouts", "1"),
+        ("input_tokens", True),
+        ("cost_usd", "0.01"),
+        ("elapsed_s", None),
+    ],
+)
+def test_spreadsheet_evaluator_rejects_invalid_cached_usage_types(
+    tmp_path: Path,
+    usage_field: str,
+    invalid_value: object,
+) -> None:
+    cache_path = tmp_path / "rollouts.json"
+    student = RecordingStudent()
+    evaluator = evaluation.SpreadsheetSkillEvaluator(
+        student,
+        cache=JsonFileCache(cache_path),
+        gate_metric="hard",
+        gate_mixed_weight=0.5,
+    )
+    kwargs = {
+        "skill": SkillArtifact("main", "main", "", "## Rule\nUpdate cells."),
+        "tasks": (_evaluation_task(tmp_path, "task-a"),),
+        "split": Split.TRAIN,
+        "seed": 10,
+        "repetitions": 1,
+        "use_cache": True,
+        "blind": False,
+    }
+    evaluator.evaluate(**kwargs)
+    payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    cached_batch = next(iter(payload["rollout"].values()))
+    cached_batch["usage"][usage_field] = invalid_value
+    cache_path.write_text(json.dumps(payload), encoding="utf-8")
     student.calls.clear()
 
     with pytest.raises(RuntimeError, match="incomplete cached evaluation bundle"):
@@ -565,6 +746,125 @@ def test_executor_copies_input_executes_code_and_scores_configured_range(
 
     assert result == ExecutionResult(score=1.0, matched=1, total=1)
     assert load_workbook(init_file)["SECRET_FINAL_SHEET"]["A1"].value == "input"
+
+
+def test_executor_rejects_uncached_formula_values_instead_of_matching_none(
+    tmp_path: Path,
+) -> None:
+    init_file = tmp_path / "input.xlsx"
+    golden_file = tmp_path / "golden.xlsx"
+    _write_workbook(init_file, "=1+1")
+    _write_workbook(golden_file, "=2+2")
+
+    result = _execute_without_editing(init_file, golden_file)
+
+    assert result == ExecutionResult(0.0, 0, 0, "missing_formula_cache")
+
+
+def test_executor_distinguishes_boolean_from_numeric_values(tmp_path: Path) -> None:
+    init_file = tmp_path / "input.xlsx"
+    golden_file = tmp_path / "golden.xlsx"
+    _write_workbook(init_file, True)
+    _write_workbook(golden_file, 1)
+
+    result = _execute_without_editing(init_file, golden_file)
+
+    assert result == ExecutionResult(0.0, 0, 1)
+
+
+def test_executor_requires_matching_merge_topology_in_answer_range(
+    tmp_path: Path,
+) -> None:
+    init_file = tmp_path / "input.xlsx"
+    golden_file = tmp_path / "golden.xlsx"
+    _write_workbook(init_file, "same")
+    _write_workbook(golden_file, "same")
+    result_workbook = load_workbook(init_file)
+    result_workbook["SECRET_FINAL_SHEET"].merge_cells("A1:B1")
+    result_workbook.save(init_file)
+
+    result = _execute_without_editing(
+        init_file,
+        golden_file,
+        answer_position="A1:B1",
+    )
+
+    assert result == ExecutionResult(0.0, 0, 0, "merge_topology_mismatch")
+
+
+def test_executor_compares_merge_anchor_when_range_contains_only_non_anchor(
+    tmp_path: Path,
+) -> None:
+    init_file = tmp_path / "input.xlsx"
+    golden_file = tmp_path / "golden.xlsx"
+    _write_workbook(init_file, "wrong")
+    _write_workbook(golden_file, "right")
+    for path in (init_file, golden_file):
+        workbook = load_workbook(path)
+        workbook["SECRET_FINAL_SHEET"].merge_cells("A1:B1")
+        workbook.save(path)
+
+    result = _execute_without_editing(
+        init_file,
+        golden_file,
+        answer_position="B1",
+    )
+
+    assert result == ExecutionResult(0.0, 0, 1)
+
+
+@pytest.mark.parametrize("unsupported_value", [float("nan"), "#DIV/0!"])
+def test_executor_rejects_nonfinite_or_unsupported_cell_values(
+    tmp_path: Path,
+    unsupported_value: object,
+) -> None:
+    init_file = tmp_path / "input.xlsx"
+    golden_file = tmp_path / "golden.xlsx"
+    _write_workbook(init_file, unsupported_value)
+    _write_workbook(golden_file, unsupported_value)
+
+    result = _execute_without_editing(init_file, golden_file)
+
+    assert result == ExecutionResult(0.0, 0, 0, "unsupported_cell_value")
+
+
+def test_executor_strictly_matches_supported_typed_values(tmp_path: Path) -> None:
+    init_file = tmp_path / "input.xlsx"
+    golden_file = tmp_path / "golden.xlsx"
+    values = (17, 2.5, "exact", datetime(2026, 7, 15, 3, 30))
+    for path in (init_file, golden_file):
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.title = "SECRET_FINAL_SHEET"
+        for column, value in enumerate(values, start=1):
+            worksheet.cell(row=1, column=column, value=value)
+        workbook.save(path)
+
+    result = _execute_without_editing(
+        init_file,
+        golden_file,
+        answer_position="A1:D1",
+    )
+
+    assert result == ExecutionResult(1.0, 4, 4)
+
+
+def test_executor_allows_matching_styled_blank_cells(tmp_path: Path) -> None:
+    init_file = tmp_path / "input.xlsx"
+    golden_file = tmp_path / "golden.xlsx"
+    for path in (init_file, golden_file):
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.title = "SECRET_FINAL_SHEET"
+        worksheet["A1"].fill = PatternFill(
+            fill_type="solid",
+            fgColor="FFFF00",
+        )
+        workbook.save(path)
+
+    result = _execute_without_editing(init_file, golden_file)
+
+    assert result == ExecutionResult(1.0, 1, 1)
 
 
 def test_executor_rejects_empty_code_without_running_a_subprocess(
@@ -692,28 +992,41 @@ def test_executor_timeout_is_invalid_and_uses_only_allowed_environment(
     assert captured["start_new_session"] is (os.name != "nt")
 
 
-def test_executor_timeout_terminates_descendant_processes(
+@pytest.mark.skipif(os.name == "nt", reason="RLIMIT_NPROC is POSIX-only")
+@pytest.mark.parametrize("exit_mode", ["normal", "nonzero", "timeout"])
+def test_executor_prevents_detached_descendants_for_every_exit_path(
     tmp_path: Path,
-    monkeypatch,
+    exit_mode: str,
 ) -> None:
     init_file = tmp_path / "input.xlsx"
     golden_file = tmp_path / "golden.xlsx"
-    child_pid_file = tmp_path / "child.pid"
-    _write_workbook(init_file, "input")
-    _write_workbook(golden_file, "golden")
-    executor = SpreadsheetExecutor()
-    monkeypatch.setattr(executor, "_TIMEOUT_SECONDS", 0.2, raising=False)
+    child_pid_file = tmp_path / "detached-child.pid"
+    blocked_file = tmp_path / "spawn-blocked.txt"
+    _write_workbook(init_file, "same")
+    _write_workbook(golden_file, "same")
+    mode_action = {
+        "normal": "pass",
+        "nonzero": "raise RuntimeError('intentional failure')",
+        "timeout": "time.sleep(30)",
+    }[exit_mode]
     code = (
         "import subprocess, sys, time\n"
         "from pathlib import Path\n"
-        "child = subprocess.Popen(\n"
-        "    [sys.executable, '-c', 'import time; time.sleep(30)'],\n"
-        "    stdout=subprocess.DEVNULL,\n"
-        "    stderr=subprocess.DEVNULL,\n"
-        ")\n"
-        f"Path({str(child_pid_file)!r}).write_text(str(child.pid))\n"
-        "time.sleep(30)\n"
+        "try:\n"
+        "    child = subprocess.Popen(\n"
+        "        [sys.executable, '-c', 'import time; time.sleep(30)'],\n"
+        "        stdout=subprocess.DEVNULL,\n"
+        "        stderr=subprocess.DEVNULL,\n"
+        "        start_new_session=True,\n"
+        "    )\n"
+        f"    Path({str(child_pid_file)!r}).write_text(str(child.pid))\n"
+        "except BlockingIOError as exc:\n"
+        f"    Path({str(blocked_file)!r}).write_text(str(exc))\n"
+        f"{mode_action}\n"
     )
+    executor = SpreadsheetExecutor()
+    if exit_mode == "timeout":
+        executor._TIMEOUT_SECONDS = 0.2
 
     result = executor.execute_and_score(
         code=code,
@@ -722,12 +1035,23 @@ def test_executor_timeout_terminates_descendant_processes(
         answer_position="A1",
         answer_sheet="SECRET_FINAL_SHEET",
     )
-    child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+    child_pid = (
+        int(child_pid_file.read_text(encoding="utf-8"))
+        if child_pid_file.exists()
+        else None
+    )
     try:
-        assert result == ExecutionResult(0.0, 0, 0, "timeout_8s")
-        assert _wait_for_process_exit(child_pid)
+        assert blocked_file.is_file()
+        assert child_pid is None
+        if exit_mode == "normal":
+            assert result == ExecutionResult(1.0, 1, 1)
+        elif exit_mode == "nonzero":
+            assert result.score == 0.0
+            assert "intentional failure" in result.error
+        else:
+            assert result == ExecutionResult(0.0, 0, 0, "timeout_8s")
     finally:
-        if _process_exists(child_pid):
+        if child_pid is not None and _process_exists(child_pid):
             os.kill(child_pid, signal.SIGKILL)
 
 
@@ -787,6 +1111,9 @@ def test_executor_import_or_runtime_failure_is_explicitly_invalid(
     [
         ("MISSING_SHEET", "A1", "missing_golden_sheet"),
         ("SECRET_FINAL_SHEET", "not-a-range", "invalid_answer_position"),
+        ("SECRET_FINAL_SHEET", "B2:A1", "invalid_answer_position"),
+        ("SECRET_FINAL_SHEET", "A1048577", "invalid_answer_position"),
+        ("SECRET_FINAL_SHEET", "XFE1", "invalid_answer_position"),
     ],
 )
 def test_executor_rejects_misaligned_golden_metadata_before_execution(
@@ -975,9 +1302,7 @@ def test_student_prompt_has_exactly_one_forced_skill_path(
     assert skill.body in call["system"]
     assert "SECRET_FINAL_SHEET" in call["system"]
     assert "B17:C19" in call["system"]
-    assert call["messages"] == [
-        {"role": "user", "content": "Update the workbook."}
-    ]
+    assert call["messages"] == [{"role": "user", "content": "Update the workbook."}]
 
 
 @pytest.mark.parametrize(
@@ -1006,6 +1331,57 @@ def test_student_empty_missing_or_invalid_code_is_invalid(
     assert trajectory.evaluation_valid is False
     assert trajectory.hard_reward == 0.0
     assert trajectory.invalid_reason
+
+
+@pytest.mark.parametrize("language", ["bash", "json"])
+def test_student_rejects_non_python_fenced_blocks_before_execution(
+    tmp_path: Path,
+    monkeypatch,
+    language: str,
+) -> None:
+    client = RecordingClient(response=f"```{language}\n{{}}\n```")
+    student = SpreadsheetStudent(STUDENT_CONFIG, client)
+    monkeypatch.setattr(
+        student.executor,
+        "execute_and_score",
+        lambda **kwargs: pytest.fail("non-Python code must not be executed"),
+    )
+
+    trajectory = student.run_task(
+        _final_task(tmp_path),
+        SkillArtifact("main", "main", "", "## Rule\nUpdate cells."),
+        blind=True,
+        seed=7,
+    )
+
+    assert trajectory.evaluation_valid is False
+    assert trajectory.invalid_reason == "missing_executable_code"
+
+
+def test_executor_injects_wb_path_without_preceding_future_import(
+    tmp_path: Path,
+) -> None:
+    init_file = tmp_path / "input.xlsx"
+    golden_file = tmp_path / "golden.xlsx"
+    _write_workbook(init_file, "input")
+    _write_workbook(golden_file, "golden")
+    code = (
+        "from __future__ import annotations\n"
+        "from openpyxl import load_workbook\n"
+        "workbook = load_workbook(wb_path)\n"
+        "workbook['SECRET_FINAL_SHEET']['A1'] = 'golden'\n"
+        "workbook.save(wb_path)\n"
+    )
+
+    result = SpreadsheetExecutor().execute_and_score(
+        code=code,
+        init_file=str(init_file),
+        golden_file=str(golden_file),
+        answer_position="A1",
+        answer_sheet="SECRET_FINAL_SHEET",
+    )
+
+    assert result == ExecutionResult(1.0, 1, 1)
 
 
 @pytest.mark.parametrize(
