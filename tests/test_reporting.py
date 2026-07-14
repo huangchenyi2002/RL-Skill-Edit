@@ -31,6 +31,21 @@ class FakeTask:
     task_id: str
 
 
+@dataclass(frozen=True)
+class EvaluationBatchWithAnswerKey(EvaluationBatch):
+    answer_key: str = "secret"
+
+
+@dataclass(frozen=True)
+class TaskResultWithGoldenAnswer(TaskResult):
+    golden_answer: str = "secret"
+
+
+class FalsyMapping(dict):
+    def __bool__(self) -> bool:
+        return False
+
+
 def _skill(skill_id: str, marker: str) -> SkillArtifact:
     return SkillArtifact(
         skill_id=skill_id,
@@ -100,6 +115,21 @@ class BatchOverrideEvaluator(FrozenEvaluator):
 def _replace_first_result(batch: EvaluationBatch, **changes) -> EvaluationBatch:
     first, *rest = batch.results
     return replace(batch, results=(replace(first, **changes), *rest))
+
+
+def _replace_first_result_with_subclass(batch: EvaluationBatch) -> EvaluationBatch:
+    first, *rest = batch.results
+    leaked = TaskResultWithGoldenAnswer(
+        task_id=first.task_id,
+        reward=first.reward,
+        success=first.success,
+        feedback=first.feedback,
+        evaluator_output=first.evaluator_output,
+        final_answer=first.final_answer,
+        visible_logs=first.visible_logs,
+        raw_rewards=first.raw_rewards,
+    )
+    return replace(batch, results=(leaked, *rest))
 
 
 def _run_report(
@@ -341,6 +371,27 @@ def test_frozen_report_rejects_invalid_blind_batch_schema(
         _run_report(tmp_path, evaluator=evaluator)
 
 
+def test_frozen_report_rejects_evaluation_batch_subclass_with_answer_key(tmp_path):
+    def add_answer_key(batch):
+        return EvaluationBatchWithAnswerKey(
+            split=batch.split,
+            results=batch.results,
+            cache_hit=batch.cache_hit,
+            usage=batch.usage,
+        )
+
+    with pytest.raises(TypeError, match="non-EvaluationBatch"):
+        _run_report(tmp_path, evaluator=BatchOverrideEvaluator(add_answer_key))
+
+
+def test_frozen_report_rejects_task_result_subclass_with_golden_answer(tmp_path):
+    with pytest.raises(TypeError, match="results\\[0\\] must be a TaskResult"):
+        _run_report(
+            tmp_path,
+            evaluator=BatchOverrideEvaluator(_replace_first_result_with_subclass),
+        )
+
+
 def test_frozen_report_evaluates_only_initial_and_rl(tmp_path):
     evaluator = FrozenEvaluator()
     result, _ = _run_report(tmp_path, evaluator=evaluator)
@@ -446,6 +497,31 @@ def test_optimization_usage_rejects_cached_work_above_logical_work(
         _run_report(tmp_path, optimization_usage=usage)
 
 
+@pytest.mark.parametrize(
+    ("invalid_case", "message"),
+    (
+        ("missing", "optimization_usage is missing fields"),
+        ("unknown", "optimization_usage has unknown fields"),
+        ("nan", "optimization_usage.cost_usd must be finite"),
+    ),
+)
+def test_nonempty_falsy_optimization_usage_is_still_strictly_validated(
+    tmp_path, invalid_case, message
+):
+    usage = _full_optimization_usage()
+    if invalid_case == "missing":
+        usage.pop("edit_count")
+    elif invalid_case == "unknown":
+        usage["unknown"] = 1
+    else:
+        usage["cost_usd"] = float("nan")
+    falsy_usage = FalsyMapping(usage)
+    assert len(falsy_usage) > 0 and not falsy_usage
+
+    with pytest.raises(ValueError, match=message):
+        _run_report(tmp_path, optimization_usage=falsy_usage)
+
+
 def test_nonempty_reporting_usage_requires_both_methods(tmp_path):
     usage = _full_reporting_usage()
     usage.pop("rl_skill_edit")
@@ -495,6 +571,31 @@ def test_reporting_usage_rejects_cached_work_above_logical_work(
         _run_report(tmp_path, reporting_usage=usage)
 
 
+@pytest.mark.parametrize(
+    ("invalid_case", "message"),
+    (
+        ("missing", "reporting_usage is missing methods"),
+        ("unknown", "reporting_usage has unknown methods"),
+        ("nan", "reporting_usage.initial_skill.cost_usd must be finite"),
+    ),
+)
+def test_nonempty_falsy_reporting_usage_is_still_strictly_validated(
+    tmp_path, invalid_case, message
+):
+    usage = _full_reporting_usage()
+    if invalid_case == "missing":
+        usage.pop("rl_skill_edit")
+    elif invalid_case == "unknown":
+        usage["unknown"] = {}
+    else:
+        usage["initial_skill"]["cost_usd"] = float("nan")
+    falsy_usage = FalsyMapping(usage)
+    assert len(falsy_usage) > 0 and not falsy_usage
+
+    with pytest.raises(ValueError, match=message):
+        _run_report(tmp_path, reporting_usage=falsy_usage)
+
+
 def _seed_old_outputs(tmp_path, names=OUTPUT_FILES) -> dict[str, bytes]:
     previous = {
         name: f"old report bytes for {name}\n".encode("utf-8") for name in names
@@ -502,6 +603,21 @@ def _seed_old_outputs(tmp_path, names=OUTPUT_FILES) -> dict[str, bytes]:
     for name, content in previous.items():
         (tmp_path / name).write_bytes(content)
     return previous
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX symbolic links")
+def test_report_rejects_dangling_output_symlink_without_modifying_it(tmp_path):
+    target = tmp_path / "comparison_report.json"
+    link_destination = "missing-comparison-report.json"
+    target.symlink_to(link_destination)
+    assert os.path.lexists(target) and not target.exists()
+
+    with pytest.raises(ValueError, match="report target must be a file"):
+        _run_report(tmp_path)
+
+    assert target.is_symlink()
+    assert os.readlink(target) == link_destination
+    assert {path.name for path in tmp_path.iterdir()} == {target.name}
 
 
 def test_report_staging_failure_leaves_all_existing_outputs_unchanged(

@@ -90,13 +90,14 @@ class ResourceUsage:
     def from_mapping(cls, value: Mapping[str, Any]) -> ResourceUsage:
         if not isinstance(value, Mapping):
             raise TypeError("optimization_usage must be a mapping")
-        if not value:
+        payload = dict(value)
+        if len(payload) == 0:
             return cls()
         allowed = set(_RESOURCE_INTEGER_FIELDS) | set(_RESOURCE_NUMBER_FIELDS)
-        missing = allowed - set(value)
+        missing = allowed - set(payload)
         if missing:
             raise ValueError(f"optimization_usage is missing fields: {sorted(missing)}")
-        unknown = set(value) - allowed
+        unknown = set(payload) - allowed
         if unknown:
             raise ValueError(
                 f"optimization_usage has unknown fields: {sorted(unknown)}"
@@ -104,11 +105,11 @@ class ResourceUsage:
         parsed: dict[str, int | float] = {}
         for name in _RESOURCE_INTEGER_FIELDS:
             parsed[name] = _nonnegative_integer(
-                f"optimization_usage.{name}", value[name]
+                f"optimization_usage.{name}", payload[name]
             )
         for name in _RESOURCE_NUMBER_FIELDS:
             parsed[name] = _nonnegative_number(
-                f"optimization_usage.{name}", value[name]
+                f"optimization_usage.{name}", payload[name]
             )
         _validate_usage_totals("optimization_usage", parsed)
         _validate_cached_count(
@@ -273,24 +274,25 @@ def run_frozen_report(
     sample_count = _positive_integer("bootstrap_samples", bootstrap_samples)
     if not isinstance(reporting_usage, Mapping):
         raise TypeError("reporting_usage must be a mapping")
-    if reporting_usage:
-        missing_methods = set(_METHOD_NAMES) - set(reporting_usage)
+    reporting_payload = dict(reporting_usage)
+    if len(reporting_payload) == 0:
+        parsed_reporting_usage = {
+            name: _zero_reporting_usage() for name in _METHOD_NAMES
+        }
+    else:
+        missing_methods = set(_METHOD_NAMES) - set(reporting_payload)
         if missing_methods:
             raise ValueError(
                 f"reporting_usage is missing methods: {sorted(missing_methods)}"
             )
-        unknown_methods = set(reporting_usage) - set(_METHOD_NAMES)
+        unknown_methods = set(reporting_payload) - set(_METHOD_NAMES)
         if unknown_methods:
             raise ValueError(
                 f"reporting_usage has unknown methods: {sorted(unknown_methods)}"
             )
         parsed_reporting_usage = {
-            name: _parse_reporting_usage(reporting_usage[name], method=name)
+            name: _parse_reporting_usage(reporting_payload[name], method=name)
             for name in _METHOD_NAMES
-        }
-    else:
-        parsed_reporting_usage = {
-            name: _zero_reporting_usage() for name in _METHOD_NAMES
         }
     optimization = ResourceUsage.from_mapping(optimization_usage)
     expected_ids = tuple(_task_id(task) for task in test_tasks)
@@ -317,7 +319,7 @@ def run_frozen_report(
             use_cache=False,
             blind=True,
         )
-        if not isinstance(batch, EvaluationBatch):
+        if type(batch) is not EvaluationBatch:
             raise TypeError(
                 f"formal evaluator returned a non-EvaluationBatch for {name}"
             )
@@ -453,13 +455,14 @@ def _parse_reporting_usage(
 ) -> dict[str, int | float]:
     if not isinstance(value, Mapping):
         raise TypeError(f"reporting_usage.{method} must be a mapping")
+    payload = dict(value)
     allowed = set(_REPORTING_INTEGER_FIELDS) | set(_REPORTING_NUMBER_FIELDS)
-    missing = allowed - set(value)
+    missing = allowed - set(payload)
     if missing:
         raise ValueError(
             f"reporting_usage.{method} is missing fields: {sorted(missing)}"
         )
-    unknown = set(value) - allowed
+    unknown = set(payload) - allowed
     if unknown:
         raise ValueError(
             f"reporting_usage.{method} has unknown fields: {sorted(unknown)}"
@@ -467,11 +470,11 @@ def _parse_reporting_usage(
     parsed: dict[str, int | float] = {}
     for name in _REPORTING_INTEGER_FIELDS:
         parsed[name] = _nonnegative_integer(
-            f"reporting_usage.{method}.{name}", value[name]
+            f"reporting_usage.{method}.{name}", payload[name]
         )
     for name in _REPORTING_NUMBER_FIELDS:
         parsed[name] = _nonnegative_number(
-            f"reporting_usage.{method}.{name}", value[name]
+            f"reporting_usage.{method}.{name}", payload[name]
         )
     prefix = f"reporting_usage.{method}"
     _validate_usage_totals(prefix, parsed)
@@ -521,7 +524,7 @@ def _validate_blind_batch(
         zip(batch.results, expected_ids, strict=True)
     ):
         prefix = f"formal batch for {method}.results[{index}]"
-        if not isinstance(result, TaskResult):
+        if type(result) is not TaskResult:
             raise TypeError(f"{prefix} must be a TaskResult")
         if type(result.task_id) is not str:
             raise TypeError(f"{prefix}.task_id must be text")
@@ -655,7 +658,7 @@ def _write_report_bundle(
     output_dir.mkdir(parents=True, exist_ok=True)
     for name in _REPORT_FILE_NAMES:
         target = output_dir / name
-        if target.exists() and not target.is_file():
+        if target.is_symlink() or (os.path.lexists(target) and not target.is_file()):
             raise ValueError(f"report target must be a file: {target}")
 
     with tempfile.TemporaryDirectory(
