@@ -5,6 +5,7 @@ import importlib.util
 import re
 import subprocess
 import sys
+from collections.abc import Callable, Iterable
 from pathlib import Path, PurePosixPath
 
 import yaml
@@ -53,6 +54,15 @@ FORBIDDEN_PUBLIC_PATTERNS = (
     r"\bexperiments/",
 )
 
+FORBIDDEN_RUNTIME_PATTERNS = (
+    r"\bcurrent_method\b",
+    r"\brandom_edit(?:_search)?\b",
+    r"\brandom_policy\b",
+    r"\bteacher\b",
+    r"\bosd\b",
+    r"\breference_(?:baseline|endpoint|method|rollout)\b",
+)
+
 README_OPENING = """# RL-Skill-Edit
 
 RL-Skill-Edit optimizes one external Markdown Skill while the agent model remains frozen.
@@ -85,16 +95,11 @@ def _matches_path(path: str, forbidden: str) -> bool:
 
 
 def _is_unexpected_runtime_python_path(path: str) -> bool:
-    components = _casefold_path_components(path)
-    return (
-        bool(components)
-        and components[-1].endswith(".py")
-        and components[0]
-        not in {
-            "rl_skill_edit",
-            "tests",
-        }
-    )
+    parsed = PurePosixPath(path)
+    if parsed.suffix.casefold() != ".py":
+        return False
+    components = parsed.parts
+    return len(components) < 2 or components[0] not in {"rl_skill_edit", "tests"}
 
 
 def _original_namespace_imports(source: str) -> tuple[str, ...]:
@@ -114,6 +119,31 @@ def _original_namespace_imports(source: str) -> tuple[str, ...]:
     return tuple(invalid)
 
 
+def _runtime_boundary_violations(
+    tracked_paths: Iterable[str],
+    source_loader: Callable[[str], str],
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    unexpected: list[str] = []
+    invalid_imports: list[str] = []
+    invalid_markers: list[str] = []
+    for path in tracked_paths:
+        parsed = PurePosixPath(path)
+        if parsed.suffix.casefold() != ".py":
+            continue
+        if _is_unexpected_runtime_python_path(path):
+            unexpected.append(path)
+            continue
+        if parsed.parts[0] != "rl_skill_edit":
+            continue
+        source = source_loader(path)
+        for module in _original_namespace_imports(source):
+            invalid_imports.append(f"{path}:{module}")
+        for marker in FORBIDDEN_RUNTIME_PATTERNS:
+            if re.search(marker, source, flags=re.IGNORECASE):
+                invalid_markers.append(f"{path}:{marker}")
+    return tuple(unexpected), tuple(invalid_imports), tuple(invalid_markers)
+
+
 def test_rl_is_the_top_level_package() -> None:
     assert importlib.util.find_spec("rl_skill_edit") is not None
 
@@ -125,11 +155,27 @@ def test_boundary_helpers_reject_mixed_case_original_paths_and_imports() -> None
     assert not _matches_path("src_backup/agent.py", "src")
     assert _is_unexpected_runtime_python_path("SRC/agent.PY")
     assert _is_unexpected_runtime_python_path("EXPERIMENTS/run.py")
-    assert not _is_unexpected_runtime_python_path("RL_SKILL_EDIT/cli.PY")
-    assert not _is_unexpected_runtime_python_path("Tests/test_cli.py")
+    assert _is_unexpected_runtime_python_path("RL_SKILL_EDIT/cli.PY")
+    assert _is_unexpected_runtime_python_path("Tests/test_cli.py")
     assert _original_namespace_imports(
         "import Src.agent\nfrom EXPERIMENTS.x import runner\n"
     ) == ("Src.agent", "EXPERIMENTS.x")
+
+
+def test_runtime_boundary_scans_injected_tracked_sources_end_to_end() -> None:
+    sources = {
+        "rl_skill_edit/legacy.PY": "import Src.agent\n",
+        "RL_SKILL_EDIT/legacy.PY": "import os\n",
+        "tests/test_clean.py": "import pathlib\n",
+    }
+
+    unexpected, invalid_imports, invalid_markers = _runtime_boundary_violations(
+        tuple(sources), sources.__getitem__
+    )
+
+    assert unexpected == ("RL_SKILL_EDIT/legacy.PY",)
+    assert invalid_imports == ("rl_skill_edit/legacy.PY:Src.agent",)
+    assert invalid_markers == ()
 
 
 def test_published_tree_contains_no_original_method_paths() -> None:
@@ -141,32 +187,15 @@ def test_published_tree_contains_no_original_method_paths() -> None:
     ]
     assert forbidden == []
 
-    runtime_python = [
-        path for path in tracked if _is_unexpected_runtime_python_path(path)
-    ]
-    assert runtime_python == []
-
 
 def test_runtime_has_no_original_namespace_imports_or_method_branches() -> None:
-    invalid_imports: list[str] = []
-    invalid_markers: list[str] = []
-    for path in sorted((ROOT / "rl_skill_edit").rglob("*.py")):
-        source = path.read_text(encoding="utf-8")
-        for module in _original_namespace_imports(source):
-            invalid_imports.append(f"{path.relative_to(ROOT)}:{module}")
-        for marker in (
-            r"\bcurrent_method\b",
-            r"\brandom_edit(?:_search)?\b",
-            r"\brandom_policy\b",
-            r"\bteacher\b",
-            r"\bosd\b",
-            r"\breference_(?:baseline|endpoint|method|rollout)\b",
-        ):
-            if re.search(marker, source, flags=re.IGNORECASE):
-                invalid_markers.append(f"{path.relative_to(ROOT)}:{marker}")
-
-    assert invalid_imports == []
-    assert invalid_markers == []
+    unexpected, invalid_imports, invalid_markers = _runtime_boundary_violations(
+        _tracked_files(),
+        lambda path: (ROOT / path).read_text(encoding="utf-8"),
+    )
+    assert unexpected == ()
+    assert invalid_imports == ()
+    assert invalid_markers == ()
 
 
 def test_public_documents_describe_only_rl_skill_edit() -> None:

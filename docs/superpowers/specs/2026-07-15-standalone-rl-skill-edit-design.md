@@ -103,9 +103,11 @@ adapter、预算和路径所需的完整设置，不再通过 `repository_config
 2. 每个 episode 从相同 initial Skill 开始。策略只读取 Train 可见结果并选择
    `(module, operator)`；Editor 只收到该 Train evidence。
 3. paired Train reward 更新策略；Validation 只选择 checkpoint，不进入策略更新。
-4. RL Skill 和所有 provenance 冻结后才加载 Test manifest。
-5. Test 对 initial 和 RL 使用相同 task 顺序、Student 配置、seed、repetitions 和 blind
-   prompt，并禁用 cache read。
+4. **更新后的设计决定：**Validation 选定不可变 RL Skill 后，唯一 loader 才读取 Test
+   manifest 和 workbooks 形成内容 digest；训练将该 digest 写入 provenance，`--test-only`
+   用重新计算的 digest 完成全部 provenance 绑定校验。
+5. 只有 provenance 写入或完整绑定校验成功后才执行 Test。initial 和 RL 使用相同 task
+   顺序、Student 配置、seed、repetitions 和 blind prompt，并禁用 cache read。
 
 ## 失败规则
 
