@@ -90,6 +90,23 @@ def _tree_bytes(path: Path) -> dict[str, bytes]:
     }
 
 
+def _tree_snapshot(path: Path) -> dict[str, tuple[Any, ...]]:
+    if not os.path.lexists(path):
+        return {}
+    snapshot: dict[str, tuple[Any, ...]] = {".": ("directory",)}
+    for item in sorted(path.rglob("*")):
+        relative = str(item.relative_to(path))
+        if item.is_symlink():
+            snapshot[relative] = ("symlink", os.readlink(item))
+        elif item.is_dir():
+            snapshot[relative] = ("directory",)
+        elif item.is_file():
+            snapshot[relative] = ("file", item.read_bytes())
+        else:
+            snapshot[relative] = ("special",)
+    return snapshot
+
+
 def test_parser_has_only_the_fixed_rl_flags() -> None:
     args = parse_args(["--config", "config.yaml", "--seed", "9", "--test-only"])
     assert args.config == Path("config.yaml")
@@ -297,6 +314,73 @@ def test_test_only_rejects_missing_or_unknown_provenance_fields(
         run(config_path, seed=42, test_only=True)
 
 
+def test_test_only_rejects_boolean_seed_even_when_it_equals_integer_one(
+    tmp_path: Path,
+) -> None:
+    config_path = _smoke_config_in(tmp_path)
+    run(config_path, seed=1)
+    provenance_path = _provenance_path(config_path)
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    provenance["seed"] = True
+    provenance_path.write_text(
+        json.dumps(provenance, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(TypeError, match=r"provenance\.seed"):
+        run(config_path, seed=1, test_only=True)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error", "message"),
+    (
+        ("protocol_type", TypeError, r"provenance\.protocol"),
+        ("method_type", TypeError, r"provenance\.method"),
+        ("digest_type", TypeError, r"provenance\.best_skill_digest"),
+        ("digest_shape", ValueError, "64 lowercase hexadecimal"),
+        ("split_extra", ValueError, r"provenance\.split_digests"),
+        ("split_value_type", TypeError, r"provenance\.split_digests\.train"),
+        ("identity_extra", ValueError, r"provenance\.skill_identity"),
+        ("identity_value_type", TypeError, r"provenance\.skill_identity\.name"),
+    ),
+)
+def test_test_only_validates_nested_provenance_schema_before_comparison(
+    tmp_path: Path,
+    mutation: str,
+    error: type[Exception],
+    message: str,
+) -> None:
+    config_path = _smoke_config_in(tmp_path)
+    run(config_path, seed=42)
+    provenance_path = _provenance_path(config_path)
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    if mutation == "protocol_type":
+        provenance["protocol"] = False
+    elif mutation == "method_type":
+        provenance["method"] = 7
+    elif mutation == "digest_type":
+        provenance["best_skill_digest"] = 7
+    elif mutation == "digest_shape":
+        provenance["best_skill_digest"] = "not-a-digest"
+    elif mutation == "split_extra":
+        provenance["split_digests"]["holdout"] = "0" * 64
+    elif mutation == "split_value_type":
+        provenance["split_digests"]["train"] = True
+    elif mutation == "identity_extra":
+        provenance["skill_identity"]["unknown"] = "forbidden"
+    elif mutation == "identity_value_type":
+        provenance["skill_identity"]["name"] = False
+    else:
+        raise AssertionError(mutation)
+    provenance_path.write_text(
+        json.dumps(provenance, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(error, match=message):
+        run(config_path, seed=42, test_only=True)
+
+
 @pytest.mark.parametrize("location", ("top", "student"))
 def test_config_rejects_unknown_top_level_and_nested_fields(
     tmp_path: Path,
@@ -325,6 +409,90 @@ def test_config_rejects_rl_artifact_path_mismatch_before_training(
     with pytest.raises(ValueError, match="paths.rl_skill must point"):
         run(config_path, seed=42)
     assert not Path(value["paths"]["output_dir"]).exists()
+
+
+def test_config_rejects_future_artifact_target_beneath_symlink(
+    tmp_path: Path,
+) -> None:
+    config_path = _smoke_config_in(tmp_path)
+    value = _config(config_path)
+    output_dir = Path(value["paths"]["output_dir"])
+    external = tmp_path / "external-output"
+    output_dir.mkdir(parents=True)
+    external.mkdir()
+    (output_dir / "rl_skill_edit").symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symbolic link"):
+        run(config_path, seed=42)
+    assert tuple(external.iterdir()) == ()
+
+
+def test_config_rejects_external_same_content_skill_symlink(tmp_path: Path) -> None:
+    config_path = _smoke_config_in(tmp_path)
+    value = _config(config_path)
+    original = Path(value["paths"]["initial_skill"])
+    alias = tmp_path / "initial-skill-alias.md"
+    alias.symlink_to(original)
+    value["paths"]["initial_skill"] = str(alias)
+    _write_config(config_path, value)
+
+    with pytest.raises(ValueError, match="symbolic link"):
+        run(config_path, seed=42)
+
+
+def test_config_rejects_dangling_initial_skill_symlink(tmp_path: Path) -> None:
+    config_path = _smoke_config_in(tmp_path)
+    value = _config(config_path)
+    alias = tmp_path / "dangling-initial-skill.md"
+    alias.symlink_to(tmp_path / "missing-initial-skill.md")
+    value["paths"]["initial_skill"] = str(alias)
+    _write_config(config_path, value)
+
+    with pytest.raises(ValueError, match="symbolic link"):
+        run(config_path, seed=42)
+
+
+def test_manifest_rejects_symlinked_workbook_input(tmp_path: Path) -> None:
+    config_path = _smoke_config_in(tmp_path)
+    value = _config(config_path)
+    train_path = Path(value["paths"]["train_manifest"])
+    tasks = json.loads(train_path.read_text(encoding="utf-8"))
+    workbook = train_path.parent / tasks[0]["spreadsheet"]["init_file"]
+    external = tmp_path / "external-workbook.txt"
+    external.write_bytes(workbook.read_bytes())
+    workbook.unlink()
+    workbook.symlink_to(external)
+
+    with pytest.raises(ValueError, match="symbolic link"):
+        run(config_path, seed=42)
+
+
+def test_test_only_rejects_symlink_anywhere_inside_frozen_output(
+    tmp_path: Path,
+) -> None:
+    config_path = _smoke_config_in(tmp_path)
+    trained = run(config_path, seed=42)
+    output_dir = Path(trained["output_dir"])
+    external = tmp_path / "external-evidence.txt"
+    external.write_text("outside", encoding="utf-8")
+    injected = output_dir / "rl_skill_edit/injected-link.txt"
+    injected.symlink_to(external)
+
+    with pytest.raises(ValueError, match="symbolic link"):
+        run(config_path, seed=42, test_only=True)
+    assert injected.is_symlink()
+
+
+def test_test_only_rejects_special_file_inside_frozen_output(
+    tmp_path: Path,
+) -> None:
+    config_path = _smoke_config_in(tmp_path)
+    trained = run(config_path, seed=42)
+    injected = Path(trained["output_dir"]) / "rl_skill_edit/injected-pipe"
+    os.mkfifo(injected)
+
+    with pytest.raises(ValueError, match="special file"):
+        run(config_path, seed=42, test_only=True)
 
 
 def test_cli_rejects_overlapping_split_task_ids(tmp_path: Path) -> None:
@@ -380,17 +548,16 @@ def test_training_bundle_commit_failure_rolls_back_existing_files(
 ) -> None:
     config_path = _smoke_config_in(tmp_path)
     trained = run(config_path, seed=42)
-    method_dir = Path(trained["output_dir"]) / "rl_skill_edit"
-    before = _tree_bytes(method_dir)
+    output_dir = Path(trained["output_dir"])
+    before = _tree_snapshot(output_dir)
     real_replace = os.replace
 
     def fail_new_bundle(source, target):
         source_path = Path(source)
         target_path = Path(target)
         if (
-            source_path.parent.name.startswith(".rl-training-")
-            and source_path.name == "rl_skill_edit"
-            and target_path == method_dir
+            source_path.name.startswith(".rl-output-staging-")
+            and target_path == output_dir
         ):
             raise OSError("injected bundle commit failure")
         real_replace(source, target)
@@ -399,4 +566,134 @@ def test_training_bundle_commit_failure_rolls_back_existing_files(
 
     with pytest.raises(OSError, match="injected bundle"):
         run(config_path, seed=42)
-    assert _tree_bytes(method_dir) == before
+    assert _tree_snapshot(output_dir) == before
+
+
+def test_manifest_write_failure_preserves_entire_previous_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = _smoke_config_in(tmp_path)
+    trained = run(config_path, seed=42)
+    output_dir = Path(trained["output_dir"])
+    before = _tree_snapshot(output_dir)
+    original_write = cli._atomic_json_write
+
+    def fail_manifest(path: Path, value: dict[str, Any]) -> None:
+        if path.name == "experiment_manifest.json":
+            raise OSError("injected manifest write failure")
+        original_write(path, value)
+
+    monkeypatch.setattr(cli, "_atomic_json_write", fail_manifest)
+
+    with pytest.raises(OSError, match="injected manifest"):
+        run(config_path, seed=42)
+    assert _tree_snapshot(output_dir) == before
+
+
+def test_report_failure_with_new_seed_preserves_entire_previous_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = _smoke_config_in(tmp_path)
+    trained = run(config_path, seed=42)
+    output_dir = Path(trained["output_dir"])
+    before = _tree_snapshot(output_dir)
+    original_report = cli.run_frozen_report
+
+    def fail_seed_43(**kwargs):
+        if kwargs["seed"] == 43:
+            raise RuntimeError("injected report failure for seed 43")
+        return original_report(**kwargs)
+
+    monkeypatch.setattr(cli, "run_frozen_report", fail_seed_43)
+
+    with pytest.raises(RuntimeError, match="seed 43"):
+        run(config_path, seed=43)
+    assert _tree_snapshot(output_dir) == before
+
+
+def test_initial_run_failure_leaves_final_output_absent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = _smoke_config_in(tmp_path)
+    output_dir = Path(_config(config_path)["paths"]["output_dir"])
+
+    def fail_report(**kwargs):
+        raise RuntimeError("injected initial report failure")
+
+    monkeypatch.setattr(cli, "run_frozen_report", fail_report)
+
+    with pytest.raises(RuntimeError, match="initial report"):
+        run(config_path, seed=42)
+    assert not os.path.lexists(output_dir)
+
+
+def test_test_only_report_failure_preserves_entire_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = _smoke_config_in(tmp_path)
+    trained = run(config_path, seed=42)
+    output_dir = Path(trained["output_dir"])
+    before = _tree_snapshot(output_dir)
+
+    def fail_report(**kwargs):
+        raise RuntimeError("injected test-only report failure")
+
+    monkeypatch.setattr(cli, "run_frozen_report", fail_report)
+
+    with pytest.raises(RuntimeError, match="test-only report"):
+        run(config_path, seed=42, test_only=True)
+    assert _tree_snapshot(output_dir) == before
+
+
+def test_backup_cleanup_failure_restores_entire_previous_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = _smoke_config_in(tmp_path)
+    trained = run(config_path, seed=42)
+    output_dir = Path(trained["output_dir"])
+    before = _tree_snapshot(output_dir)
+    original_remove = cli._remove_tree
+
+    def fail_backup_cleanup(path: Path) -> None:
+        if path.name.startswith(".rl-output-backup-"):
+            raise OSError("injected backup cleanup failure")
+        original_remove(path)
+
+    monkeypatch.setattr(cli, "_remove_tree", fail_backup_cleanup)
+
+    with pytest.raises(RuntimeError, match="backup cleanup"):
+        run(config_path, seed=42)
+    assert _tree_snapshot(output_dir) == before
+
+
+def test_install_and_rollback_failure_retains_explicit_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = _smoke_config_in(tmp_path)
+    trained = run(config_path, seed=42)
+    output_dir = Path(trained["output_dir"])
+    real_replace = os.replace
+
+    def fail_install_and_restore(source, target):
+        source_path = Path(source)
+        target_path = Path(target)
+        if target_path == output_dir and (
+            source_path.name.startswith(".rl-output-staging-")
+            or source_path.name.startswith(".rl-output-backup-")
+        ):
+            raise OSError("injected install or rollback failure")
+        real_replace(source, target)
+
+    monkeypatch.setattr(cli.os, "replace", fail_install_and_restore)
+
+    with pytest.raises(cli.OutputRollbackError, match="evidence retained"):
+        run(config_path, seed=42)
+    assert not os.path.lexists(output_dir)
+    assert tuple(tmp_path.glob(".rl-output-staging-*"))
+    assert tuple(tmp_path.glob(".rl-output-backup-*"))
