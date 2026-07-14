@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from openpyxl import Workbook
 
-from baselines.rl_skill_edit.manifest import (
+from rl_skill_edit.manifest import (
     Split,
     TaskManifest,
     validate_manifests,

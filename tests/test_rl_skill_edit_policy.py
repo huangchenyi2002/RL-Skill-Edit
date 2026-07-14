@@ -5,8 +5,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from baselines.rl_skill_edit.policy import ActorCriticPolicy
-from baselines.rl_skill_edit.types import Transition
+from rl_skill_edit.policy import ActorCriticPolicy
+from rl_skill_edit.types import Transition
 
 
 def _policy(seed: int = 7) -> ActorCriticPolicy:

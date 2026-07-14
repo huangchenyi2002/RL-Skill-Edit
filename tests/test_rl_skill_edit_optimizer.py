@@ -11,11 +11,11 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from baselines.rl_skill_edit.action_space import EditOperator
-from baselines.rl_skill_edit.cache import JsonFileCache
-from baselines.rl_skill_edit.evaluation import MockSkillEvaluator
-from baselines.rl_skill_edit.optimizer import RLSkillEditOptimizer
-from baselines.rl_skill_edit.types import (
+from rl_skill_edit.action_space import EditOperator
+from rl_skill_edit.cache import JsonFileCache
+from rl_skill_edit.evaluation import MockSkillEvaluator
+from rl_skill_edit.optimizer import RLSkillEditOptimizer
+from rl_skill_edit.types import (
     EditPatch,
     EvaluationBatch,
     GeneratedPatch,

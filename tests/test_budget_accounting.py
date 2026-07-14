@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from baselines.rl_skill_edit.budget import BudgetExceeded, BudgetLedger
-from baselines.rl_skill_edit.cache import JsonFileCache
+from rl_skill_edit.budget import BudgetExceeded, BudgetLedger
+from rl_skill_edit.cache import JsonFileCache
 
 
 LIMITS = {

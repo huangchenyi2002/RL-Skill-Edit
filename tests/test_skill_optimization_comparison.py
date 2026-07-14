@@ -8,13 +8,13 @@ from dataclasses import dataclass
 
 import pytest
 
-from baselines.rl_skill_edit.comparison import (
+from rl_skill_edit.comparison import (
     load_current_method_artifact,
     paired_bootstrap_ci,
     paired_statistics,
     run_comparison,
 )
-from baselines.rl_skill_edit.types import EvaluationBatch, SkillArtifact, TaskResult
+from rl_skill_edit.types import EvaluationBatch, SkillArtifact, TaskResult
 
 
 @dataclass(frozen=True)

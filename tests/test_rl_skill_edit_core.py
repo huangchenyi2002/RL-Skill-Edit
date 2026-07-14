@@ -5,11 +5,11 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from baselines.rl_skill_edit.action_space import ActionSpace, EditOperator
-from baselines.rl_skill_edit.modules import attribute_failures, parse_modules
-from baselines.rl_skill_edit.reward import compute_incremental_reward
-from baselines.rl_skill_edit.state_encoder import StateEncoder
-from baselines.rl_skill_edit.types import (
+from rl_skill_edit.action_space import ActionSpace, EditOperator
+from rl_skill_edit.modules import attribute_failures, parse_modules
+from rl_skill_edit.reward import compute_incremental_reward
+from rl_skill_edit.state_encoder import StateEncoder
+from rl_skill_edit.types import (
     EvaluationBatch,
     ModuleDiagnostics,
     SkillArtifact,

@@ -5,15 +5,15 @@ from pathlib import Path
 
 import pytest
 
-from baselines.rl_skill_edit.action_space import EditOperator
-from baselines.rl_skill_edit.cache import JsonFileCache
-from baselines.rl_skill_edit.modules import parse_modules
-from baselines.rl_skill_edit.patch_generator import (
+from rl_skill_edit.action_space import EditOperator
+from rl_skill_edit.cache import JsonFileCache
+from rl_skill_edit.modules import parse_modules
+from rl_skill_edit.patch_generator import (
     MockPatchGenerator,
     OpenRouterPatchGenerator,
 )
-from baselines.rl_skill_edit.patch_validator import validate_and_apply_patch
-from baselines.rl_skill_edit.types import (
+from rl_skill_edit.patch_validator import validate_and_apply_patch
+from rl_skill_edit.types import (
     Action,
     EditPatch,
     EvaluationBatch,
