@@ -164,7 +164,7 @@ def test_boundary_helpers_reject_mixed_case_original_paths_and_imports() -> None
 
 def test_runtime_boundary_scans_injected_tracked_sources_end_to_end() -> None:
     sources = {
-        "rl_skill_edit/legacy.PY": "import Src.agent\n",
+        "rl_skill_edit/legacy.PY": "import Src.agent\ncurrent_method = None\n",
         "RL_SKILL_EDIT/legacy.PY": "import os\n",
         "tests/test_clean.py": "import pathlib\n",
     }
@@ -175,7 +175,9 @@ def test_runtime_boundary_scans_injected_tracked_sources_end_to_end() -> None:
 
     assert unexpected == ("RL_SKILL_EDIT/legacy.PY",)
     assert invalid_imports == ("rl_skill_edit/legacy.PY:Src.agent",)
-    assert invalid_markers == ()
+    assert invalid_markers == (
+        f"rl_skill_edit/legacy.PY:{FORBIDDEN_RUNTIME_PATTERNS[0]}",
+    )
 
 
 def test_published_tree_contains_no_original_method_paths() -> None:
