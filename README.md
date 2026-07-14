@@ -293,6 +293,14 @@ Skill hash is frozen; it reruns the initial Skill and all final methods with the
 same ordered tasks, Student settings, repetitions, seed, blind prompt, and no
 cache reads.
 
+Before training, the CLI rejects any overlap between protected inputs and the
+final or retained-previous output paths without opening the Test manifest.
+After Validation freezes the Skill, the sole Test loader resolves its workbook
+paths and a second audit runs before publication. Published trees carry
+`.rl-skill-edit-output.json`, an exact ownership marker bound to the lexical
+final output path; an unowned or incomplete `.<output-name>.previous` tree is
+rejected and never deleted.
+
 The default real configuration mirrors the observed 2026-07-14 run closely: 12
 episodes, at most 2 edits per episode, 26 train tasks per step, 3 Validation
 repetitions, at most 25 Editor calls, and no Teacher or Reference calls. The
@@ -368,6 +376,7 @@ The main artifacts are:
 | `rl_skill_edit/rl_training_log.jsonl` | Per-step action, probability, value, patch, paired task rewards, penalties, and budget |
 | `rl_skill_edit/rl_episode_summary.csv` | Episode returns, policy losses, and checkpoint paths |
 | `rl_skill_edit/freeze_provenance.json` | Frozen Skill, initial Skill, config, implementation, dependencies, optimization summary, seed, and split digests required by `--test-only` |
+| `.rl-skill-edit-output.json` | Exact output ownership marker bound to the lexical final output path |
 | `test_task_level_results.csv` | Raw aligned Test rewards for every method and task |
 | `method_comparison.csv` | Train/Validation/Test means, paired CI, win/tie/loss, Skill size, edits, and separate optimization/reporting/total resource columns |
 | `experiment_manifest.json` | Config/code/dependency hashes, split digests, ordered IDs, seed, frozen Skill hashes, and imported current-artifact hashes |

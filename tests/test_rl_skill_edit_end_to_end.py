@@ -30,6 +30,8 @@ PROVENANCE_FIELDS = {
     "seed",
     "skill_identity",
 }
+OUTPUT_MARKER_FILE = ".rl-skill-edit-output.json"
+OUTPUT_MARKER_FIELDS = {"protocol", "method", "final_output_path"}
 
 
 def test_cli_module_exists() -> None:
@@ -111,6 +113,36 @@ def _previous_output_path(output_dir: Path) -> Path:
     return output_dir.parent / f".{output_dir.name}.previous"
 
 
+def _set_output_paths(config: dict[str, Any], output_dir: Path) -> None:
+    config["paths"].update(
+        {
+            "output_dir": str(output_dir),
+            "rl_skill": str(output_dir / "rl_skill_edit/best_rl_skill.md"),
+            "rl_summary": str(
+                output_dir / "rl_skill_edit/rl_optimization_summary.json"
+            ),
+            "rl_provenance": str(output_dir / "rl_skill_edit/freeze_provenance.json"),
+        }
+    )
+
+
+def _write_expected_output_marker(root: Path, output_dir: Path) -> Path:
+    marker = root / OUTPUT_MARKER_FILE
+    marker.write_text(
+        json.dumps(
+            {
+                "protocol": "rl-skill-edit-output-v1",
+                "method": "rl_skill_edit",
+                "final_output_path": str(output_dir),
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return marker
+
+
 def test_parser_has_only_the_fixed_rl_flags() -> None:
     args = parse_args(["--config", "config.yaml", "--seed", "9", "--test-only"])
     assert args.config == Path("config.yaml")
@@ -169,14 +201,62 @@ def test_api_free_training_and_test_only_report_initial_and_rl(tmp_path: Path) -
     }
 
 
+def test_published_output_has_exact_stable_ownership_marker(tmp_path: Path) -> None:
+    config_path = _smoke_config_in(tmp_path)
+    config = _config(config_path)
+    expected_config_sha256 = cli._normalized_config_sha256(config)
+
+    trained = run(config_path, seed=42)
+
+    output_dir = Path(trained["output_dir"])
+    marker_path = output_dir / OUTPUT_MARKER_FILE
+    marker_text = marker_path.read_text(encoding="utf-8")
+    marker = json.loads(marker_text)
+    manifest = json.loads(
+        (output_dir / "experiment_manifest.json").read_text(encoding="utf-8")
+    )
+    assert set(marker) == OUTPUT_MARKER_FIELDS
+    assert marker == {
+        "protocol": "rl-skill-edit-output-v1",
+        "method": "rl_skill_edit",
+        "final_output_path": str(output_dir),
+    }
+    assert ".rl-output-staging-" not in marker_text
+    assert manifest["config_sha256"] == expected_config_sha256
+
+
+def test_staged_output_rejects_marker_with_unknown_field(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = _smoke_config_in(tmp_path)
+    output_dir = Path(_config(config_path)["paths"]["output_dir"])
+    original_write = cli._atomic_json_write
+
+    def write_invalid_marker(path: Path, value: dict[str, Any]) -> None:
+        if path.name == OUTPUT_MARKER_FILE:
+            value = {**value, "unknown": "forbidden"}
+        original_write(path, value)
+
+    monkeypatch.setattr(cli, "_atomic_json_write", write_invalid_marker)
+
+    with pytest.raises(ValueError, match="unknown fields"):
+        run(config_path, seed=42)
+    assert not os.path.lexists(output_dir)
+    assert not tuple(tmp_path.glob(".rl-output-staging-*"))
+
+
 def test_test_manifest_is_loaded_only_after_rl_optimization_freezes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config_path = _smoke_config_in(tmp_path)
+    test_manifest = Path(_config(config_path)["paths"]["test_manifest"])
     events: list[str] = []
     original_optimize = cli.RLSkillEditOptimizer.optimize
     original_load_test = cli._load_test_manifest
+    original_read_text = Path.read_text
+    original_open = Path.open
 
     def optimize_then_mark(self, **kwargs):
         result = original_optimize(self, **kwargs)
@@ -188,8 +268,20 @@ def test_test_manifest_is_loaded_only_after_rl_optimization_freezes(
         events.append("test_loaded")
         return original_load_test(config, optimization_manifests)
 
+    def guarded_read_text(path: Path, *args, **kwargs):
+        if path == test_manifest and not events:
+            raise AssertionError("Test manifest was read before optimization froze")
+        return original_read_text(path, *args, **kwargs)
+
+    def guarded_open(path: Path, *args, **kwargs):
+        if path == test_manifest and not events:
+            raise AssertionError("Test manifest was opened before optimization froze")
+        return original_open(path, *args, **kwargs)
+
     monkeypatch.setattr(cli.RLSkillEditOptimizer, "optimize", optimize_then_mark)
     monkeypatch.setattr(cli, "_load_test_manifest", load_test_after_freeze)
+    monkeypatch.setattr(Path, "read_text", guarded_read_text)
+    monkeypatch.setattr(Path, "open", guarded_open)
 
     run(config_path, seed=42)
     assert events == ["optimized", "test_loaded"]
@@ -574,6 +666,251 @@ def test_training_bundle_commit_failure_rolls_back_existing_files(
     assert not os.path.lexists(_previous_output_path(output_dir))
 
 
+def test_first_run_rejects_unowned_previous_without_modifying_it(
+    tmp_path: Path,
+) -> None:
+    config_path = _smoke_config_in(tmp_path)
+    output_dir = Path(_config(config_path)["paths"]["output_dir"])
+    previous = _previous_output_path(output_dir)
+    previous.mkdir()
+    (previous / "sentinel.txt").write_bytes(b"must-not-be-deleted\x00")
+    before = _tree_snapshot(previous)
+
+    with pytest.raises((FileNotFoundError, ValueError), match="previous output"):
+        run(config_path, seed=42)
+
+    assert _tree_snapshot(previous) == before
+    assert not os.path.lexists(output_dir)
+    assert not tuple(tmp_path.glob(".rl-output-staging-*"))
+
+
+def test_pretraining_input_audit_excludes_test_workbooks_without_omitting_its_path(
+    tmp_path: Path,
+) -> None:
+    config_path = _smoke_config_in(tmp_path)
+    config = _config(config_path)
+    inputs = cli._pretraining_input_paths(config_path, config)
+    actual = set(inputs.values())
+    expected = {
+        config_path,
+        ROOT / "requirements.txt",
+        ROOT / "rl_skill_edit",
+        Path(config["paths"]["initial_skill"]),
+        Path(config["paths"]["train_manifest"]),
+        Path(config["paths"]["validation_manifest"]),
+        Path(config["paths"]["test_manifest"]),
+        *(ROOT / "rl_skill_edit").rglob("*.py"),
+    }
+    for field in ("train_manifest", "validation_manifest"):
+        manifest_path = Path(config["paths"][field])
+        tasks = json.loads(manifest_path.read_text(encoding="utf-8"))
+        for task in tasks:
+            for workbook_field in ("init_file", "golden_file"):
+                expected.add(manifest_path.parent / task["spreadsheet"][workbook_field])
+
+    test_manifest = Path(config["paths"]["test_manifest"])
+    test_tasks = json.loads(test_manifest.read_text(encoding="utf-8"))
+    test_workbooks = {
+        test_manifest.parent / task["spreadsheet"][field]
+        for task in test_tasks
+        for field in ("init_file", "golden_file")
+    }
+
+    assert actual == expected
+    assert actual.isdisjoint(test_workbooks)
+    assert ROOT not in actual
+    cli._validate_output_input_separation(Path(config["paths"]["output_dir"]), inputs)
+
+
+@pytest.mark.parametrize("input_is_ancestor", (False, True))
+def test_output_input_separation_rejects_both_ancestor_directions(
+    tmp_path: Path,
+    input_is_ancestor: bool,
+) -> None:
+    if input_is_ancestor:
+        input_path = tmp_path / "protected"
+        output_dir = input_path / "result"
+    else:
+        output_dir = tmp_path / "result"
+        input_path = output_dir / "protected.txt"
+
+    with pytest.raises(ValueError, match="unsafe output path overlap"):
+        cli._validate_output_input_separation(
+            output_dir,
+            {"protected input": input_path},
+        )
+
+
+def test_postload_input_audit_includes_the_actual_staging_path(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "result"
+    staging = tmp_path / ".rl-output-staging-fixed"
+
+    with pytest.raises(ValueError, match="unsafe output path overlap"):
+        cli._validate_output_input_separation(
+            output_dir,
+            {"protected input": staging / "test-workbook.xlsx"},
+            staging=staging,
+        )
+
+
+@pytest.mark.parametrize("mutable_path", ("output", "previous"))
+def test_output_paths_must_not_overlap_the_input_tree(
+    tmp_path: Path,
+    mutable_path: str,
+) -> None:
+    config_path = _smoke_config_in(tmp_path)
+    config = _config(config_path)
+    data_dir = Path(config["paths"]["initial_skill"]).parent
+    output_dir = Path(config["paths"]["output_dir"])
+    if mutable_path == "output":
+        output_dir = data_dir
+        _set_output_paths(config, output_dir)
+        protected = data_dir
+    else:
+        previous = _previous_output_path(output_dir)
+        data_dir.rename(previous)
+        for field, filename in (
+            ("initial_skill", "initial_skill.md"),
+            ("train_manifest", "train.json"),
+            ("validation_manifest", "validation.json"),
+            ("test_manifest", "test.json"),
+        ):
+            config["paths"][field] = str(previous / filename)
+        protected = previous
+    _write_config(config_path, config)
+    before = _tree_snapshot(protected)
+
+    with pytest.raises(ValueError, match="unsafe output path overlap"):
+        run(config_path, seed=42)
+
+    assert _tree_snapshot(protected) == before
+    assert not tuple(tmp_path.glob(".rl-output-staging-*"))
+
+
+def test_test_workbook_overlap_is_rejected_after_optimization_before_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = _smoke_config_in(tmp_path)
+    trained = run(config_path, seed=42)
+    config = _config(config_path)
+    output_dir = Path(trained["output_dir"])
+    test_manifest = Path(config["paths"]["test_manifest"])
+    protected_workbook = output_dir / "protected-test-init.txt"
+    protected_workbook.write_bytes(b"protected test input\x00")
+    tasks = json.loads(test_manifest.read_text(encoding="utf-8"))
+    tasks[0]["spreadsheet"]["init_file"] = str(protected_workbook)
+    test_manifest.write_text(json.dumps(tasks), encoding="utf-8")
+    output_before = _tree_snapshot(output_dir)
+    manifest_before = test_manifest.read_bytes()
+    workbook_before = protected_workbook.read_bytes()
+    events: list[str] = []
+    original_optimize = cli.RLSkillEditOptimizer.optimize
+
+    def optimize_then_mark(self, **kwargs):
+        result = original_optimize(self, **kwargs)
+        events.append("optimized")
+        return result
+
+    monkeypatch.setattr(cli.RLSkillEditOptimizer, "optimize", optimize_then_mark)
+
+    with pytest.raises(ValueError, match="unsafe output path overlap"):
+        run(config_path, seed=43)
+
+    assert events == ["optimized"]
+    assert _tree_snapshot(output_dir) == output_before
+    assert test_manifest.read_bytes() == manifest_before
+    assert protected_workbook.read_bytes() == workbook_before
+    assert not os.path.lexists(_previous_output_path(output_dir))
+    assert not tuple(tmp_path.glob(".rl-output-staging-*"))
+
+
+@pytest.mark.parametrize("test_only", (False, True))
+def test_existing_output_without_marker_is_rejected_unchanged(
+    tmp_path: Path,
+    test_only: bool,
+) -> None:
+    config_path = _smoke_config_in(tmp_path)
+    trained = run(config_path, seed=42)
+    output_dir = Path(trained["output_dir"])
+    marker = _write_expected_output_marker(output_dir, output_dir)
+    marker.unlink()
+    before = _tree_snapshot(output_dir)
+
+    with pytest.raises(FileNotFoundError, match="ownership marker"):
+        run(config_path, seed=42 if test_only else 43, test_only=test_only)
+
+    assert _tree_snapshot(output_dir) == before
+    assert not os.path.lexists(_previous_output_path(output_dir))
+    assert not tuple(tmp_path.glob(".rl-output-staging-*"))
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "missing",
+        "wrong_binding",
+        "symlink",
+        "nan",
+        "unknown",
+        "incomplete",
+        "incomplete_episode",
+    ),
+)
+def test_invalid_or_incomplete_previous_output_is_never_deleted(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    config_path = _smoke_config_in(tmp_path)
+    trained = run(config_path, seed=42)
+    output_dir = Path(trained["output_dir"])
+    _write_expected_output_marker(output_dir, output_dir)
+    previous = _previous_output_path(output_dir)
+    shutil.copytree(output_dir, previous)
+    marker = previous / OUTPUT_MARKER_FILE
+    if mutation == "missing":
+        marker.unlink()
+    elif mutation == "wrong_binding":
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+        payload["final_output_path"] = str(tmp_path / "somewhere-else")
+        marker.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    elif mutation == "symlink":
+        external = tmp_path / "external-marker.json"
+        external.write_text(marker.read_text(encoding="utf-8"), encoding="utf-8")
+        marker.unlink()
+        marker.symlink_to(external)
+    elif mutation == "nan":
+        marker.write_text(
+            '{"protocol":"rl-skill-edit-output-v1",'
+            '"method":"rl_skill_edit","final_output_path":NaN}\n',
+            encoding="utf-8",
+        )
+    elif mutation == "unknown":
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+        payload["unknown"] = "forbidden"
+        marker.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    elif mutation == "incomplete":
+        (previous / "experiment_manifest.json").unlink()
+    elif mutation == "incomplete_episode":
+        (
+            previous
+            / "rl_skill_edit/episodes/episode_0000/skills/step_000_candidate.md"
+        ).unlink()
+    else:
+        raise AssertionError(mutation)
+    output_before = _tree_snapshot(output_dir)
+    previous_before = _tree_snapshot(previous)
+
+    with pytest.raises((FileNotFoundError, TypeError, ValueError)):
+        run(config_path, seed=43)
+
+    assert _tree_snapshot(output_dir) == output_before
+    assert _tree_snapshot(previous) == previous_before
+    assert not tuple(tmp_path.glob(".rl-output-staging-*"))
+
+
 def test_successful_retraining_keeps_complete_previous_output_snapshot(
     tmp_path: Path,
 ) -> None:
@@ -588,6 +925,28 @@ def test_successful_retraining_keeps_complete_previous_output_snapshot(
     previous = _previous_output_path(output_dir)
     assert _tree_snapshot(previous) == before
     assert cli._tree_fingerprint(previous) == before_fingerprint
+
+
+def test_three_publications_rotate_owned_previous_for_train_and_test_only(
+    tmp_path: Path,
+) -> None:
+    config_path = _smoke_config_in(tmp_path)
+    first = run(config_path, seed=42)
+    output_dir = Path(first["output_dir"])
+    first_snapshot = _tree_snapshot(output_dir)
+
+    run(config_path, seed=42, test_only=True)
+    second_snapshot = _tree_snapshot(output_dir)
+    previous = _previous_output_path(output_dir)
+    assert _tree_snapshot(previous) == first_snapshot
+
+    run(config_path, seed=43)
+
+    assert _tree_snapshot(previous) == second_snapshot
+    previous_marker = json.loads(
+        (previous / OUTPUT_MARKER_FILE).read_text(encoding="utf-8")
+    )
+    assert previous_marker["final_output_path"] == str(output_dir)
 
 
 def test_post_install_previous_validation_failure_restores_current_output(

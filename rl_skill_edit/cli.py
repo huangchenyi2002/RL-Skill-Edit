@@ -92,6 +92,20 @@ _REPORT_FILES = {
     "test_task_level_results.csv",
     "comparison_report.json",
 }
+_OUTPUT_MARKER_FILE = ".rl-skill-edit-output.json"
+_OUTPUT_MARKER_FIELDS = {"protocol", "method", "final_output_path"}
+_PUBLISHED_METHOD_FILES = {
+    "best_rl_skill.md",
+    "final_rl_policy.pt",
+    "freeze_provenance.json",
+    "rl_episode_summary.csv",
+    "rl_optimization_summary.json",
+    "rl_training_log.jsonl",
+}
+_PUBLISHED_TOP_LEVEL_FILES = _REPORT_FILES | {
+    _OUTPUT_MARKER_FILE,
+    "experiment_manifest.json",
+}
 _HEX_DIGITS = frozenset("0123456789abcdef")
 
 
@@ -579,7 +593,7 @@ def _load_initial_skill(
     return _canonical_skill(loaded, identity=identity)
 
 
-def _validate_manifest_inputs(path: Path, *, name: str) -> Path:
+def _manifest_declared_input_paths(path: Path, *, name: str) -> dict[str, Path]:
     path = _require_regular_file(path, name=name)
 
     def reject_constant(value: str) -> None:
@@ -590,6 +604,7 @@ def _validate_manifest_inputs(path: Path, *, name: str) -> Path:
     )
     if type(payload) is not list:
         raise TypeError(f"{name} must be a JSON array")
+    inputs = {name: path}
     for index, task in enumerate(payload):
         if type(task) is not dict:
             raise TypeError(f"{name}[{index}] must be an object")
@@ -603,11 +618,96 @@ def _validate_manifest_inputs(path: Path, *, name: str) -> Path:
                     f"{name}[{index}].spreadsheet.{field} must be a file path"
                 )
             workbook = _lexical_absolute(value, base=path.parent)
-            _require_regular_file(
+            inputs[f"{name}[{index}].spreadsheet.{field}"] = _require_regular_file(
                 workbook,
                 name=f"{name}[{index}].spreadsheet.{field}",
             )
-    return path
+    return inputs
+
+
+def _validate_manifest_inputs(path: Path, *, name: str) -> Path:
+    return _manifest_declared_input_paths(path, name=name)[name]
+
+
+def _pretraining_input_paths(
+    config_path: Path, config: Mapping[str, Any]
+) -> dict[str, Path]:
+    implementation_root = _require_directory(
+        REPOSITORY_ROOT / "rl_skill_edit", name="rl_skill_edit implementation"
+    )
+    implementation_files = tuple(sorted(implementation_root.rglob("*.py")))
+    if not implementation_files:
+        raise RuntimeError("rl_skill_edit implementation files are missing")
+    inputs = {
+        "config": _require_regular_file(config_path, name="config"),
+        "requirements.txt": _require_regular_file(
+            REQUIREMENTS_PATH, name="requirements.txt"
+        ),
+        "rl_skill_edit implementation": implementation_root,
+        "paths.initial_skill": _require_regular_file(
+            _path(config, "initial_skill"), name="paths.initial_skill"
+        ),
+    }
+    for index, implementation_file in enumerate(implementation_files):
+        inputs[f"rl_skill_edit implementation file {index}"] = _require_regular_file(
+            implementation_file, name="rl_skill_edit implementation file"
+        )
+    for field in ("train_manifest", "validation_manifest"):
+        name = f"paths.{field}"
+        inputs.update(_manifest_declared_input_paths(_path(config, field), name=name))
+    inputs["paths.test_manifest"] = _require_regular_file(
+        _path(config, "test_manifest"), name="paths.test_manifest"
+    )
+    return inputs
+
+
+def _loaded_manifest_input_paths(
+    manifests: Mapping[Split, TaskManifest],
+) -> dict[str, Path]:
+    inputs: dict[str, Path] = {}
+    for split in Split:
+        manifest = manifests[split]
+        inputs[f"loaded {split.value} manifest"] = _require_regular_file(
+            manifest.source_path,
+            name=f"loaded {split.value} manifest",
+        )
+        for index, task in enumerate(manifest.tasks):
+            spreadsheet = task["spreadsheet"]
+            for field in ("init_file", "golden_file"):
+                name = f"loaded {split.value}[{index}].spreadsheet.{field}"
+                inputs[name] = _require_regular_file(
+                    Path(spreadsheet[field]),
+                    name=name,
+                )
+    return inputs
+
+
+def _paths_overlap(left: Path, right: Path) -> bool:
+    return left == right or left in right.parents or right in left.parents
+
+
+def _validate_output_input_separation(
+    output_dir: Path,
+    inputs: Mapping[str, Path],
+    *,
+    staging: Path | None = None,
+) -> None:
+    output_dir = _lexical_absolute(output_dir, base=Path.cwd())
+    mutable_paths = {
+        "final output": output_dir,
+        "previous output": _previous_output_path(output_dir),
+    }
+    if staging is not None:
+        mutable_paths["staging output"] = _lexical_absolute(staging, base=Path.cwd())
+    for mutable_name, mutable_path in mutable_paths.items():
+        for input_name, input_path in inputs.items():
+            protected = _lexical_absolute(input_path, base=Path.cwd())
+            if _paths_overlap(mutable_path, protected):
+                raise ValueError(
+                    "unsafe output path overlap: "
+                    f"{mutable_name} {mutable_path} and {input_name} "
+                    f"{protected} must be disjoint"
+                )
 
 
 def _load_optimization_manifests(
@@ -928,6 +1028,155 @@ def _validate_provenance_schema(provenance: Mapping[str, Any]) -> dict[str, Any]
     return payload
 
 
+def _expected_output_marker(output_dir: Path) -> dict[str, str]:
+    final_output = _lexical_absolute(output_dir, base=Path.cwd())
+    return {
+        "protocol": "rl-skill-edit-output-v1",
+        "method": "rl_skill_edit",
+        "final_output_path": str(final_output),
+    }
+
+
+def _validate_output_marker(
+    root: Path, output_dir: Path, *, name: str
+) -> dict[str, Any]:
+    marker_path = _require_regular_file(
+        root / _OUTPUT_MARKER_FILE, name=f"{name} ownership marker"
+    )
+    marker = _exact_mapping(
+        _strict_json_mapping(marker_path, name=f"{name} ownership marker"),
+        name=f"{name} ownership marker",
+        required=_OUTPUT_MARKER_FIELDS,
+    )
+    expected = _expected_output_marker(output_dir)
+    for field in ("protocol", "method", "final_output_path"):
+        actual = _text(f"{name} ownership marker.{field}", marker[field])
+        if actual != expected[field]:
+            raise ValueError(
+                f"{name} ownership marker.{field} is not bound to {expected[field]!r}"
+            )
+    return marker
+
+
+def _validate_structured_output(paths: Sequence[Path], *, name: str) -> None:
+    nonfinite_literals = {"nan", "+nan", "-nan", "inf", "+inf", "-inf", "infinity"}
+    for path in paths:
+        if not path.is_file():
+            continue
+
+        def reject_constant(value: str) -> None:
+            raise ValueError(
+                f"{name} contains non-finite structured value {value}: {path}"
+            )
+
+        if path.suffix == ".json":
+            json.loads(path.read_text(encoding="utf-8"), parse_constant=reject_constant)
+        elif path.suffix == ".jsonl":
+            for line in path.read_text(encoding="utf-8").splitlines():
+                json.loads(line, parse_constant=reject_constant)
+        elif path.suffix == ".csv":
+            with path.open(encoding="utf-8", newline="") as handle:
+                for row in csv.reader(handle):
+                    if any(
+                        cell.strip().casefold() in nonfinite_literals for cell in row
+                    ):
+                        raise ValueError(
+                            f"{name} contains a non-finite CSV value: {path}"
+                        )
+
+
+def _require_bundle_artifact(method_dir: Path, value: Any, *, name: str) -> Path:
+    reference_text = _text(name, value)
+    reference = Path(reference_text)
+    if reference.is_absolute() or ".." in reference.parts:
+        raise ValueError(f"{name} must be a bundle-relative path")
+    target = _lexical_absolute(reference, base=method_dir)
+    method_root = _lexical_absolute(method_dir, base=Path.cwd())
+    if method_root not in target.parents:
+        raise ValueError(f"{name} must stay inside the RL bundle")
+    return _require_regular_file(target, name=name)
+
+
+def _validate_bundle_artifact_references(method_dir: Path, *, name: str) -> None:
+    training_log = method_dir / "rl_training_log.jsonl"
+    log_lines = training_log.read_text(encoding="utf-8").splitlines()
+    if not log_lines:
+        raise ValueError(f"{name} RL training log must not be empty")
+    for index, line in enumerate(log_lines):
+        row = json.loads(line)
+        if type(row) is not dict:
+            raise TypeError(f"{name} RL training log row {index} must be an object")
+        for field in ("current_skill_path", "candidate_skill_path"):
+            _require_bundle_artifact(
+                method_dir,
+                row.get(field),
+                name=f"{name} RL training log row {index}.{field}",
+            )
+
+    episode_summary = method_dir / "rl_episode_summary.csv"
+    reference_fields = {
+        "final_skill_path",
+        "best_skill_path",
+        "policy_checkpoint_path",
+        "trajectory_path",
+    }
+    with episode_summary.open(encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        fields = set(reader.fieldnames or ())
+        if not reference_fields <= fields:
+            raise ValueError(f"{name} RL episode summary is missing artifact fields")
+        rows = tuple(reader)
+    if not rows:
+        raise ValueError(f"{name} RL episode summary must not be empty")
+    for index, row in enumerate(rows):
+        for field in reference_fields:
+            _require_bundle_artifact(
+                method_dir,
+                row[field],
+                name=f"{name} RL episode summary row {index}.{field}",
+            )
+
+
+def _validate_published_output_structure(
+    root: Path, output_dir: Path, *, name: str
+) -> tuple[Path, ...]:
+    paths = _validate_real_tree(root, name=name)
+    _validate_output_marker(root, output_dir, name=name)
+    method_dir = _require_directory(root / "rl_skill_edit", name=f"{name} RL bundle")
+    for file_name in _PUBLISHED_TOP_LEVEL_FILES:
+        _require_regular_file(root / file_name, name=f"{name} {file_name}")
+    for file_name in _PUBLISHED_METHOD_FILES:
+        _require_regular_file(method_dir / file_name, name=f"{name} {file_name}")
+    _validate_structured_output(paths, name=name)
+    _validate_bundle_artifact_references(method_dir, name=name)
+    return paths
+
+
+def _validate_published_output(
+    root: Path, output_dir: Path, *, name: str
+) -> tuple[tuple[Path, ...], dict[str, Any]]:
+    paths = _validate_published_output_structure(root, output_dir, name=name)
+    method_dir = root / "rl_skill_edit"
+
+    skill_path = method_dir / "best_rl_skill.md"
+    summary_path = method_dir / "rl_optimization_summary.json"
+    provenance_path = method_dir / "freeze_provenance.json"
+    provenance = _validate_provenance_schema(
+        _strict_json_mapping(provenance_path, name=f"{name} RL provenance")
+    )
+    identity = provenance["skill_identity"]
+    skill = _canonical_skill(
+        SkillArtifact.from_file(skill_path, skill_id=identity["skill_id"]),
+        identity=identity,
+    )
+    summary = _strict_json_mapping(summary_path, name=f"{name} RL summary")
+    _validate_summary(summary, skill_digest=skill.digest)
+    _strict_json_mapping(
+        root / "experiment_manifest.json", name=f"{name} experiment manifest"
+    )
+    return paths, provenance
+
+
 def _validate_existing_output(
     artifact_paths: Mapping[str, Path], *, require_frozen: bool
 ) -> None:
@@ -936,15 +1185,21 @@ def _validate_existing_output(
         if require_frozen:
             raise FileNotFoundError(f"frozen output does not exist: {output_dir}")
         return
-    _validate_real_tree(output_dir, name="existing output")
-    method_dir = artifact_paths["method_dir"]
-    has_method = os.path.lexists(method_dir)
-    if require_frozen or has_method:
-        _require_directory(method_dir, name="existing frozen RL bundle")
-        for field in ("rl_skill", "rl_summary", "rl_provenance"):
-            _require_regular_file(
-                artifact_paths[field], name=f"existing frozen {field}"
-            )
+    _validate_published_output_structure(
+        output_dir,
+        output_dir,
+        name="existing output",
+    )
+
+
+def _validate_previous_output(output_dir: Path) -> None:
+    previous = _previous_output_path(output_dir)
+    if os.path.lexists(previous):
+        _validate_published_output(
+            previous,
+            output_dir,
+            name="previous output snapshot",
+        )
 
 
 def _tree_fingerprint(root: Path) -> str:
@@ -1040,68 +1295,23 @@ def _new_staging_output(output_dir: Path) -> Path:
 
 
 def _validate_staged_output(
-    staging_output: Path, *, identity: Mapping[str, Any]
+    staging_output: Path,
+    *,
+    output_dir: Path,
+    identity: Mapping[str, Any],
 ) -> None:
-    paths = _validate_real_tree(staging_output, name="staging output")
-    method_dir = _require_directory(
-        staging_output / "rl_skill_edit", name="staged RL bundle"
+    paths, provenance = _validate_published_output(
+        staging_output,
+        output_dir,
+        name="staging output",
     )
-    skill_path = _require_regular_file(
-        method_dir / "best_rl_skill.md", name="staged RL Skill"
-    )
-    summary_path = _require_regular_file(
-        method_dir / "rl_optimization_summary.json",
-        name="staged RL optimization summary",
-    )
-    provenance_path = _require_regular_file(
-        method_dir / "freeze_provenance.json", name="staged RL provenance"
-    )
-    for file_name in _REPORT_FILES | {"experiment_manifest.json"}:
-        _require_regular_file(
-            staging_output / file_name, name=f"staged output {file_name}"
-        )
-
-    skill = _canonical_skill(
-        SkillArtifact.from_file(skill_path, skill_id=identity["skill_id"]),
-        identity=identity,
-    )
-    summary = _strict_json_mapping(summary_path, name="staged RL summary")
-    _validate_summary(summary, skill_digest=skill.digest)
-    provenance = _strict_json_mapping(provenance_path, name="staged RL provenance")
-    _validate_provenance_schema(provenance)
-    _strict_json_mapping(
-        staging_output / "experiment_manifest.json",
-        name="staged experiment manifest",
-    )
+    if provenance["skill_identity"] != dict(identity):
+        raise ValueError("staged output Skill identity does not match config")
 
     staging_text = str(staging_output)
-    nonfinite_literals = {"nan", "+nan", "-nan", "inf", "+inf", "-inf", "infinity"}
     for path in paths:
         if not path.is_file():
             continue
-
-        def reject_constant(value: str) -> None:
-            raise ValueError(
-                f"staged structured output contains non-finite value {value}: {path}"
-            )
-
-        if path.suffix == ".json":
-            json.loads(
-                path.read_text(encoding="utf-8"),
-                parse_constant=reject_constant,
-            )
-        elif path.suffix == ".jsonl":
-            for line in path.read_text(encoding="utf-8").splitlines():
-                json.loads(line, parse_constant=reject_constant)
-        elif path.suffix == ".csv":
-            with path.open(encoding="utf-8", newline="") as handle:
-                for row in csv.reader(handle):
-                    if any(
-                        cell.strip().casefold() in nonfinite_literals for cell in row
-                    ):
-                        raise ValueError(
-                            f"staged CSV contains non-finite value: {path}"
-                        )
         if path.suffix in {".json", ".jsonl", ".csv", ".md"}:
             if staging_text in path.read_text(encoding="utf-8"):
                 raise ValueError(f"staging path leaked into persisted artifact: {path}")
@@ -1132,17 +1342,23 @@ def _move_failed_install_to_staging(staging: Path, output_dir: Path) -> None:
 
 
 def _commit_output_tree(staging: Path, output_dir: Path) -> None:
-    _validate_real_tree(staging, name="staging output")
+    _validate_published_output(staging, output_dir, name="staging commit candidate")
     _ensure_real_directory(output_dir.parent, name="output parent")
     _allow_directory(output_dir, name="final output")
+    had_output = os.path.lexists(output_dir)
+    if had_output:
+        _validate_published_output(output_dir, output_dir, name="current output")
     previous = _previous_output_path(output_dir)
     if os.path.lexists(previous):
-        _validate_real_tree(previous, name="previous output snapshot")
+        _validate_published_output(
+            previous,
+            output_dir,
+            name="previous output snapshot",
+        )
         _remove_tree(previous)
         if os.path.lexists(previous):
             raise RuntimeError("previous output cleanup was incomplete")
 
-    had_output = os.path.lexists(output_dir)
     previous_fingerprint = _tree_fingerprint(output_dir) if had_output else ""
     if had_output:
         try:
@@ -1469,7 +1685,11 @@ def run(
     absolute_config_path = _lexical_absolute(config_path, base=Path.cwd())
     config = _load_yaml(absolute_config_path)
     artifact_paths = _artifact_paths(config)
+    output_dir = artifact_paths["output_dir"]
+    pretraining_inputs = _pretraining_input_paths(absolute_config_path, config)
+    _validate_output_input_separation(output_dir, pretraining_inputs)
     _validate_existing_output(artifact_paths, require_frozen=test_only)
+    _validate_previous_output(output_dir)
     run_seed = config["seed"] if seed is None else _integer("seed", seed)
     config_sha256 = _normalized_config_sha256(config)
     implementation_sha256 = _implementation_sha256()
@@ -1490,7 +1710,6 @@ def run(
             dependency_sha256=dependency_sha256,
             identity=identity,
         )
-    output_dir = artifact_paths["output_dir"]
     staging_output = _new_staging_output(output_dir)
     try:
         if test_only:
@@ -1507,6 +1726,13 @@ def run(
                 dependency_sha256=dependency_sha256,
                 identity=identity,
             )
+
+        loaded_inputs = _loaded_manifest_input_paths(manifests)
+        _validate_output_input_separation(
+            output_dir,
+            {**pretraining_inputs, **loaded_inputs},
+            staging=staging_output,
+        )
 
         reporting_evaluator = _make_evaluator(
             config,
@@ -1560,7 +1786,15 @@ def run(
         _atomic_json_write(
             staging_output / "experiment_manifest.json", experiment_manifest
         )
-        _validate_staged_output(staging_output, identity=identity)
+        _atomic_json_write(
+            staging_output / _OUTPUT_MARKER_FILE,
+            _expected_output_marker(output_dir),
+        )
+        _validate_staged_output(
+            staging_output,
+            output_dir=output_dir,
+            identity=identity,
+        )
         _commit_output_tree(staging_output, output_dir)
     except BaseException as error:
         if os.path.lexists(staging_output) and not isinstance(
